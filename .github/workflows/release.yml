@@ -1,0 +1,49 @@
+name: Release
+
+# Go modules are "published" by pushing a semver tag; consumers then run:
+#   go get github.com/quintessence-group/aether-sdk-go@v<version>
+# There is no registry upload. This workflow validates the tagged commit and
+# best-effort warms the public Go module proxy.
+#
+# Trigger:  git tag v<version> && git push origin v<version>
+#
+# NOTE: public `go get` requires this repository to be PUBLIC.
+# While the repo is private the proxy warm-up step cannot resolve the module and
+# is intentionally non-fatal.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Validate tag & warm proxy
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Warm Go module proxy (best-effort; requires the repo to be public)
+        continue-on-error: true
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          MODULE="github.com/quintessence-group/aether-sdk-go"
+          echo "Requesting ${MODULE}@${TAG} via proxy.golang.org ..."
+          GOPROXY=https://proxy.golang.org go list -m "${MODULE}@${TAG}" \
+            || echo "Proxy warm-up skipped/failed (expected while the repo is private —)."

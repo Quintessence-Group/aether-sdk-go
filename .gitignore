@@ -1,0 +1,8 @@
+*.exe
+*.test
+*.out
+*.cover
+coverage.txt
+go.work
+go.work.sum
+.DS_Store
