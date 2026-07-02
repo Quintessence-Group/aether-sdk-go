@@ -49,6 +49,68 @@ func TestAPIErrorWithoutCodeMatchesNothing(t *testing.T) {
 	}
 }
 
+// TestAPIErrorSentinelMatching is the billing-code fixture matrix: each
+// canonical billing code must match its own sentinel and nothing else, and
+// unrelated/empty codes must match no sentinel at all.
+func TestAPIErrorSentinelMatching(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		code    string
+		matches error   // sentinel the error MUST match (nil = none)
+		misses  []error // sentinels the error must NOT match
+	}{
+		{
+			name:    "credit_exhausted",
+			status:  402,
+			code:    CodeCreditExhausted,
+			matches: ErrCreditExhausted,
+			misses:  []error{ErrFreeLimitExceeded, ErrTenantPaused},
+		},
+		{
+			name:    "free_limit_exceeded",
+			status:  402,
+			code:    CodeFreeLimitExceeded,
+			matches: ErrFreeLimitExceeded,
+			misses:  []error{ErrCreditExhausted, ErrTenantPaused},
+		},
+		{
+			name:    "tenant_paused",
+			status:  403,
+			code:    CodeTenantPaused,
+			matches: ErrTenantPaused,
+			misses:  []error{ErrCreditExhausted, ErrFreeLimitExceeded},
+		},
+		{
+			name:    "unrelated_code",
+			status:  400,
+			code:    "some_other_code",
+			matches: nil,
+			misses:  []error{ErrCreditExhausted, ErrFreeLimitExceeded, ErrTenantPaused},
+		},
+		{
+			name:    "empty_code",
+			status:  402,
+			code:    "",
+			matches: nil,
+			misses:  []error{ErrCreditExhausted, ErrFreeLimitExceeded, ErrTenantPaused},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &APIError{StatusCode: tc.status, Message: "fixture", ErrorCode: tc.code}
+			if tc.matches != nil && !errors.Is(err, tc.matches) {
+				t.Errorf("errors.Is(err, %v) = false, want true for code %q", tc.matches, tc.code)
+			}
+			for _, miss := range tc.misses {
+				if errors.Is(err, miss) {
+					t.Errorf("errors.Is(err, %v) = true, want false for code %q", miss, tc.code)
+				}
+			}
+		})
+	}
+}
+
 func TestAPIErrorIsRetryable(t *testing.T) {
 	cases := []struct {
 		code int

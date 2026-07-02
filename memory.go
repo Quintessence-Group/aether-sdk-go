@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,10 +40,6 @@ type Memory struct {
 //
 // Score is a relevance signal (higher = more relevant) populated by Recall only;
 // it is relative within a single Recall call and not comparable across calls.
-//
-// Note: a memory's metadata is intentionally NOT a field here. Remember writes
-// metadata as searchable key:value tags, but the raw document API does not echo
-// tags on any read model, so metadata cannot be read back in v1. See the README.
 type MemoryItem struct {
 	// ID is the underlying doc_id.
 	ID string
@@ -52,6 +49,8 @@ type MemoryItem struct {
 	CreatedAt *string
 	// EntityID is the owning entity id (always the Memory's entity id).
 	EntityID *string
+	// Metadata is the structured metadata attached to the memory.
+	Metadata Metadata
 	// Score is the relevance signal for Recall results, or nil.
 	Score *float64
 }
@@ -63,6 +62,11 @@ const (
 	// maxEntityIDLen is the server's entity_id length constraint.
 	maxEntityIDLen = 256
 
+	// scoreScale normalizes the calibrated 0–100 relevance score (higher =
+	// better) onto the [0, 1] range so it shares a scale with the recency term
+	// in the Mode B blend.
+	scoreScale = 100.0
+
 	// recencyOverfetch is the candidate over-fetch factor for recency re-ranking.
 	recencyOverfetch = 4
 	// recencyMaxCandidates caps the over-fetched candidate set for recency re-ranking.
@@ -73,11 +77,6 @@ const (
 
 	// forgetAllPageSize is the listing page size used by ForgetAll.
 	forgetAllPageSize = 1000
-
-	// scoreScale normalizes the calibrated 0–100 relevance score (higher =
-	// better, since the 0.3.0 redesign) onto the [0, 1] range so it shares a
-	// scale with the recency term in the Mode B blend.
-	scoreScale = 100.0
 )
 
 // MemoryOption configures a Memory beyond the entity id. These apply to both
@@ -95,10 +94,12 @@ func WithHalfLife(d time.Duration) MemoryOption {
 	}
 }
 
-// WithFactExtraction toggles the reserved fact-extraction flag. There is no
-// server-side fact extractor in v1, so this is a no-op: when enabled, Remember
-// behaves identically to when it is disabled (stores the text as a single
-// memory). The flag keeps the surface stable for a future extractor.
+// WithFactExtraction enables server-side fact extraction for this Memory:
+// Remember distills the text into atomic facts, each stored as a sibling
+// "kind:fact" memory and recallable like any other. Requires fact extraction to
+// be configured on the node. Default disabled. The flag applies to every
+// Remember on this Memory (Go has no per-call override); use the raw client's
+// WithExtractFacts insert option for one-off control.
 func WithFactExtraction(enabled bool) MemoryOption {
 	return func(m *Memory) { m.extractFacts = enabled }
 }
@@ -142,9 +143,10 @@ func newMemory(entityID string, client *Client, opts ...MemoryOption) (*Memory, 
 // NewMemory builds a Memory with its own Client constructed from the given client
 // options (the same options accepted by New, e.g. WithAPIKey, WithBaseURL).
 // Memory-specific options (WithHalfLife, WithFactExtraction, WithClock) are not
-// accepted here; use NewMemoryWithClient when you need them. The entity id is
-// validated client-side (non-empty, 1-256 chars) — an invalid id returns an error
-// without a network round-trip.
+// accepted here; use NewMemoryWithClient when you need them, or set the half-life
+// via the underlying client is not applicable. The entity id is validated
+// client-side (non-empty, 1-256 chars) — an invalid id returns an error without a
+// network round-trip.
 func NewMemory(entityID string, opts ...Option) (*Memory, error) {
 	if err := validateEntityID(entityID); err != nil {
 		return nil, err
@@ -173,24 +175,24 @@ func (m *Memory) Client() *Client { return m.client }
 
 // Remember stores one memory for this entity. It performs a single HTTP call.
 //
-// metadata (optional) is encoded as key:value tags, one tag per pair, using the
-// first ':' as the separator. Values may contain ':' but must not contain ',' —
-// the tag wire format is comma-joined and cannot escape commas, so a value with a
-// ',' is a client-side argument error (no HTTP call is made). Keys must be
-// non-empty.
-//
-// Because the raw read models do not echo tags, metadata written here cannot be
-// read back in v1 (the returned MemoryItem has no metadata field).
+// metadata (optional) is sent as structured typed document metadata. For older
+// tag-based callers, string-safe metadata is also mirrored into key:value tags
+// where doing so is lossless. Keys must be non-empty.
 //
 // Empty/whitespace-only text is a client-side argument error.
 //
-// The extract_facts flag (WithFactExtraction) is a reserved no-op in v1: text is
-// always stored as a single memory.
-func (m *Memory) Remember(ctx context.Context, text string, metadata map[string]string) (*MemoryItem, error) {
+// When fact extraction is enabled (WithFactExtraction), the inserted text is
+// distilled server-side into atomic facts, each stored as a sibling "kind:fact"
+// memory; the returned item is still the raw memory (not the facts).
+func (m *Memory) Remember(ctx context.Context, text string, metadata any) (*MemoryItem, error) {
 	if strings.TrimSpace(text) == "" {
 		return nil, fmt.Errorf("aether: text cannot be empty")
 	}
-	tags, err := encodeMetadataTags(metadata)
+	metadataMap, err := normalizeMemoryMetadata(metadata)
+	if err != nil {
+		return nil, err
+	}
+	tags, err := encodeMetadataTags(metadataMap)
 	if err != nil {
 		return nil, err
 	}
@@ -198,28 +200,50 @@ func (m *Memory) Remember(ctx context.Context, text string, metadata map[string]
 	if len(tags) > 0 {
 		opts = append(opts, WithTags(tags))
 	}
+	if len(metadataMap) > 0 {
+		opts = append(opts, WithMetadata(metadataMap))
+	}
+	if m.extractFacts {
+		opts = append(opts, WithExtractFacts(true))
+	}
 	doc, err := m.client.InsertText(ctx, text, "", opts...)
 	if err != nil {
 		return nil, err
 	}
 	entityID := m.entityID
-	if doc.EntityID != nil && *doc.EntityID != "" {
-		entityID = *doc.EntityID
-	}
 	return &MemoryItem{
 		ID:        doc.DocID,
 		Text:      text,
 		CreatedAt: doc.CreatedAt,
 		EntityID:  &entityID,
+		Metadata:  doc.Metadata,
 		Score:     nil,
 	}, nil
 }
 
-// encodeMetadataTags encodes a metadata map into key:value tag strings. Keys are
-// sorted for deterministic output so the wire string is byte-identical across
-// languages. An empty key, a key containing ':' or ',', or a value containing ','
-// is a client-side argument error.
-func encodeMetadataTags(metadata map[string]string) ([]string, error) {
+func normalizeMemoryMetadata(metadata any) (Metadata, error) {
+	switch v := metadata.(type) {
+	case nil:
+		return nil, nil
+	case Metadata:
+		return v, nil
+	case map[string]any:
+		return Metadata(v), nil
+	case map[string]string:
+		out := make(Metadata, len(v))
+		for k, val := range v {
+			out[k] = val
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("aether: metadata must be nil, Metadata, map[string]any, or map[string]string")
+	}
+}
+
+// encodeMetadataTags best-effort mirrors structured metadata into legacy
+// key:value tags. Pairs that cannot be represented losslessly in the old
+// comma-joined tag format are skipped.
+func encodeMetadataTags(metadata Metadata) ([]string, error) {
 	if len(metadata) == 0 {
 		return nil, nil
 	}
@@ -233,7 +257,7 @@ func encodeMetadataTags(metadata map[string]string) ([]string, error) {
 	sort.Strings(keys)
 	tags := make([]string, 0, len(metadata))
 	for _, k := range keys {
-		v := metadata[k]
+		v := fmt.Sprint(metadata[k])
 		if strings.ContainsRune(k, ':') {
 			return nil, fmt.Errorf("aether: metadata key %q must not contain a colon", k)
 		}
@@ -254,6 +278,7 @@ type recallConfig struct {
 	recencyWeight float64
 	since         string
 	until         string
+	filter        MetadataFilter
 }
 
 // RecallOption configures a Recall call.
@@ -287,16 +312,20 @@ func WithRecallUntil(ts string) RecallOption {
 	return func(c *recallConfig) { c.until = ts }
 }
 
+// WithRecallFilter filters recalled memories by structured metadata.
+func WithRecallFilter(filter MetadataFilter) RecallOption {
+	return func(c *recallConfig) { c.filter = filter }
+}
+
 // Recall performs a semantic search scoped to this entity, with optional
 // client-side recency decay.
 //
 // An empty/whitespace-only query and an explicitly-requested k < 1 (via
 // WithRecallK) are client-side argument errors, returned before any HTTP call.
 //
-// With the default recency weight of 0, Recall issues one retrieve (search +
-// per-doc content download), returns memories in server order (descending
-// relevance score), populates Score from the calibrated 0–100 score normalized to
-// [0, 1], and leaves CreatedAt nil (the search response carries no timestamp).
+// With the default recency weight of 0, Recall issues exactly one retrieve call,
+// returns memories in server order (descending relevance score), populates Score
+// from the hit's calibrated score, and leaves CreatedAt nil.
 //
 // With a positive recency weight (WithRecencyWeight), Recall over-fetches
 // candidates, resolves each memory's created_at via Get (N+1 calls,
@@ -330,6 +359,9 @@ func (m *Memory) Recall(ctx context.Context, query string, opts ...RecallOption)
 	if cfg.until != "" {
 		searchOpts = append(searchOpts, WithUntil(cfg.until))
 	}
+	if len(cfg.filter) > 0 {
+		searchOpts = append(searchOpts, WithMetadataFilter(cfg.filter))
+	}
 
 	if w == 0 {
 		return m.recallSimple(ctx, query, cfg.k, searchOpts)
@@ -337,8 +369,7 @@ func (m *Memory) Recall(ctx context.Context, query string, opts ...RecallOption)
 	return m.recallRecency(ctx, query, cfg.k, w, searchOpts)
 }
 
-// recallSimple is Mode A: one retrieve (search + per-doc download), server order,
-// no timestamps.
+// recallSimple is Mode A: one retrieve call, server order, no timestamps.
 func (m *Memory) recallSimple(ctx context.Context, query string, k int, searchOpts []SearchOption) ([]MemoryItem, error) {
 	hits, err := m.client.Retrieve(ctx, query, k, searchOpts...)
 	if err != nil {
@@ -353,6 +384,7 @@ func (m *Memory) recallSimple(ctx context.Context, query string, k int, searchOp
 			Text:      h.Content,
 			CreatedAt: nil,
 			EntityID:  &entityID,
+			Metadata:  h.Metadata,
 			Score:     &score,
 		})
 	}
@@ -364,6 +396,7 @@ type recallCandidate struct {
 	docID     string
 	text      string
 	score     int
+	metadata  Metadata
 	createdAt *string
 	blended   float64
 }
@@ -389,9 +422,10 @@ func (m *Memory) recallRecency(ctx context.Context, query string, k int, w float
 	candidates := make([]recallCandidate, len(hits))
 	for i, h := range hits {
 		candidates[i] = recallCandidate{
-			docID: h.DocID,
-			text:  h.Content,
-			score: h.Score,
+			docID:    h.DocID,
+			text:     h.Content,
+			score:    h.Score,
+			metadata: h.Metadata,
 		}
 	}
 
@@ -434,6 +468,7 @@ func (m *Memory) recallRecency(ctx context.Context, query string, k int, w float
 			Text:      c.text,
 			CreatedAt: c.createdAt,
 			EntityID:  &entityID,
+			Metadata:  c.metadata,
 			Score:     &blended,
 		})
 	}
@@ -493,9 +528,9 @@ func (m *Memory) resolveCreatedAt(ctx context.Context, candidates []recallCandid
 	return result, nil
 }
 
-// similarityScore normalizes a calibrated 0–100 relevance score (higher = better,
-// since the 0.3.0 redesign) onto [0, 1] so it shares a scale with the recency term
-// in the Mode B blend.
+// similarityScore normalizes a calibrated 0–100 relevance score (higher =
+// better) onto [0, 1] so it shares a scale with the recency term in the
+// Mode B blend.
 func similarityScore(score int) float64 {
 	return float64(score) / scoreScale
 }
@@ -553,9 +588,10 @@ func parseRFC3339(s string) (time.Time, bool) {
 type MemoryListOption func(*memoryListConfig)
 
 type memoryListConfig struct {
-	since string
-	until string
-	limit int
+	since  string
+	until  string
+	filter MetadataFilter
+	limit  int
 }
 
 // WithListSince filters listed memories to those created at or after the given
@@ -580,6 +616,11 @@ func WithListLimit(limit int) MemoryListOption {
 	}
 }
 
+// WithListFilter filters listed memories by structured metadata.
+func WithListFilter(filter MetadataFilter) MemoryListOption {
+	return func(c *memoryListConfig) { c.filter = filter }
+}
+
 // List returns a chronological view of this entity's memories, newest first.
 //
 // Cost note: List is 1 + N calls — one listing plus one content download per
@@ -596,6 +637,7 @@ func (m *Memory) List(ctx context.Context, opts ...MemoryListOption) ([]MemoryIt
 		EntityID: m.entityID,
 		Since:    cfg.since,
 		Until:    cfg.until,
+		Filter:   cfg.filter,
 		Limit:    cfg.limit,
 	})
 	if err != nil {
@@ -619,10 +661,88 @@ func (m *Memory) List(ctx context.Context, opts ...MemoryListOption) ([]MemoryIt
 			Text:      texts[i],
 			CreatedAt: r.CreatedAt,
 			EntityID:  r.EntityID,
+			Metadata:  r.Metadata,
 			Score:     nil,
 		})
 	}
 	return items, nil
+}
+
+// ListExtractedFacts returns this entity's consolidated extracted facts
+// (kind:fact memories), highest corroborated confidence first.
+//
+// These are the free-text facts produced by Remember with fact extraction
+// enabled (WithFactExtraction) and deduped server-side — the clean, high-signal
+// view of what's known about the entity, distinct from any structured
+// memory-graph facts. Cost is 1 + N (one listing plus a content download per
+// fact).
+func (m *Memory) ListExtractedFacts(ctx context.Context, opts ...MemoryListOption) ([]MemoryItem, error) {
+	cfg := memoryListConfig{limit: 50}
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	res, err := m.client.List(ctx, &ListOptions{
+		EntityID: m.entityID,
+		Tags:     []string{"kind:fact"},
+		Filter:   cfg.filter,
+		Limit:    cfg.limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	records := res.Documents
+	// Highest corroborated confidence first; ties broken by recency.
+	sort.SliceStable(records, func(i, j int) bool {
+		ci, cj := factConfidence(records[i].Tags), factConfidence(records[j].Tags)
+		if ci != cj {
+			return ci > cj
+		}
+		return derefStr(records[i].CreatedAt) > derefStr(records[j].CreatedAt)
+	})
+	if len(records) > cfg.limit {
+		records = records[:cfg.limit]
+	}
+
+	texts, err := m.downloadTexts(ctx, records)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]MemoryItem, 0, len(records))
+	for i, r := range records {
+		items = append(items, MemoryItem{
+			ID:        r.DocID,
+			Text:      texts[i],
+			CreatedAt: r.CreatedAt,
+			EntityID:  r.EntityID,
+			Metadata:  r.Metadata,
+			Score:     nil,
+		})
+	}
+	return items, nil
+}
+
+// factConfidence parses a fact's conf:<n> tag (corroborating-source count),
+// defaulting to 1 when absent or unparseable.
+func factConfidence(tags []string) int {
+	for _, t := range tags {
+		if n, ok := strings.CutPrefix(t, "conf:"); ok {
+			if v, err := strconv.Atoi(n); err == nil && v > 0 {
+				return v
+			}
+			return 1
+		}
+	}
+	return 1
+}
+
+func derefStr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // downloadTexts downloads each record's text, preserving order, bounded by
