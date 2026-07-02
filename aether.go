@@ -1,4 +1,4 @@
-// Package aether provides a Go client for the Aether decentralized RAG API.
+// Package aether provides a Go client for Aether agent memory.
 package aether
 
 import (
@@ -67,6 +67,22 @@ func validateBaseURL(baseURL, apiKey string) error {
 			"use an https:// base URL, or omit the API key for local non-TLS endpoints", host)
 }
 
+// apiVersionPrefix is the canonical public API version prefix. Every data
+// route (documents, search, memory, partitions, archive) is served under it.
+// The public probe route GET /status is intentionally unversioned.
+const apiVersionPrefix = "/v1"
+
+// versionedPath prefixes a relative request path with the public API version.
+// The prefix always goes before the path itself, never into the query string.
+// Unversioned probe routes (/status) pass through untouched.
+func versionedPath(path string) string {
+	bare, _, _ := strings.Cut(path, "?")
+	if bare == "/status" {
+		return path
+	}
+	return apiVersionPrefix + path
+}
+
 // ClientOptions holds optional configuration for the Aether client.
 type ClientOptions struct {
 	// MaxRetries is the maximum number of retries for transient errors.
@@ -85,6 +101,10 @@ type Client struct {
 	httpClient   *http.Client
 	maxRetries   int
 	retryBackoff time.Duration
+	// partition, when non-empty, scopes every partition-aware read and write to
+	// a single partition. It is set only via Partition and is otherwise empty
+	// (unscoped). See Partition for the full semantics.
+	partition string
 	// cfgErr is set when the resolved configuration is unsafe (e.g. an API
 	// key paired with a cleartext-HTTP non-loopback base URL). It is returned
 	// from every request so misconfiguration fails fast and consistently.
@@ -178,10 +198,58 @@ func NewClient(baseURL string, opts ...Option) *Client {
 	return c
 }
 
+// ── Partition scoping ─────────────────────────────────────────────
+
+// maxPartitionIDLen is the maximum length of a partition id.
+const maxPartitionIDLen = 256
+
+// validatePartition checks a partition id client-side, before any HTTP call.
+// It mirrors validateEntityID: the id must be non-empty after trimming and at
+// most maxPartitionIDLen characters.
+func validatePartition(partitionID string) error {
+	if strings.TrimSpace(partitionID) == "" {
+		return fmt.Errorf("aether: partition cannot be empty")
+	}
+	if len(partitionID) > maxPartitionIDLen {
+		return fmt.Errorf("aether: partition must be 1-%d characters, got %d", maxPartitionIDLen, len(partitionID))
+	}
+	return nil
+}
+
+// Partition returns a scoped clone of this client whose every partition-aware
+// read and write is automatically scoped to the given partition. A multi-tenant
+// key requires a partition on every call; the scoped handle is the ergonomic way
+// to never forget it. The default (unscoped) client keeps operating on the
+// default partition, so single-tenant usage stays frictionless.
+//
+// The returned client shares the underlying transport and all configuration
+// (base url, api key, timeout, retries, backoff) with the receiver — it does not
+// own the transport, so the base client remains responsible for it. Scoping is
+// bound to the returned object: the only way to reach a different partition is to
+// obtain a distinct handle, and there is no per-call partition argument on any
+// data method. Re-scoping is last-wins, so
+// client.Partition("a").Partition("b") is scoped to "b".
+//
+// The partition id is validated client-side (non-empty, 1-256 chars); an invalid
+// id returns an error without a network round-trip.
+func (c *Client) Partition(partitionID string) (*Client, error) {
+	if err := validatePartition(partitionID); err != nil {
+		return nil, err
+	}
+	cp := *c
+	cp.partition = partitionID
+	return &cp, nil
+}
+
 // ── Internal helpers ──────────────────────────────────────────────
 
-func (c *Client) newRequest(ctx context.Context, method, path, contentType, idempotencyKey string, body io.Reader) (*http.Request, error) {
-	reqURL := c.baseURL + path
+// newRequest builds a request against the client's base URL. Data routes are
+// rewritten under the /v1 API version prefix here, at the transport boundary,
+// so every caller (including the Memory facade) versions its paths in one
+// place. The same choke point stamps the SDK User-Agent and, for logical
+// writes, the caller-minted Idempotency-Key (empty for reads).
+func (c *Client) newRequest(ctx context.Context, method, path, idempotencyKey string, body io.Reader) (*http.Request, error) {
+	reqURL := c.baseURL + versionedPath(path)
 	req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
 	if err != nil {
 		return nil, err
@@ -189,9 +257,6 @@ func (c *Client) newRequest(ctx context.Context, method, path, contentType, idem
 	req.Header.Set("User-Agent", userAgent)
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
 	}
 	if idempotencyKey != "" {
 		req.Header.Set("Idempotency-Key", idempotencyKey)
@@ -205,13 +270,6 @@ func isRetryableStatus(code int) bool {
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, body io.Reader, result any) error {
-	return c.doJSONCT(ctx, method, path, "", body, result)
-}
-
-// doJSONCT is like doJSON but sets an explicit Content-Type header on the
-// request. Used by endpoints that send a JSON-encoded body; the raw document
-// upload endpoints carry their content type in the query string and pass "".
-func (c *Client) doJSONCT(ctx context.Context, method, path, contentType string, body io.Reader, result any) error {
 	if c.cfgErr != nil {
 		return c.cfgErr
 	}
@@ -237,7 +295,7 @@ func (c *Client) doJSONCT(ctx context.Context, method, path, contentType string,
 		if bodyBytes != nil {
 			bodyReader = bytes.NewReader(bodyBytes)
 		}
-		return c.newRequest(ctx, method, path, contentType, idempotencyKey, bodyReader)
+		return c.newRequest(ctx, method, path, idempotencyKey, bodyReader)
 	})
 	if err != nil {
 		return err
@@ -337,7 +395,7 @@ func (c *Client) doJSONNoRetry(ctx context.Context, method, path string, body io
 	if method == http.MethodPost {
 		idempotencyKey = newIdempotencyKey()
 	}
-	req, err := c.newRequest(ctx, method, path, "", idempotencyKey, body)
+	req, err := c.newRequest(ctx, method, path, idempotencyKey, body)
 	if err != nil {
 		return &NetworkError{Err: err}
 	}
@@ -375,7 +433,7 @@ func (c *Client) doRaw(ctx context.Context, path string) ([]byte, error) {
 		return nil, c.cfgErr
 	}
 	resp, err := c.doWithRetry(ctx, func() (*http.Request, error) {
-		return c.newRequest(ctx, http.MethodGet, path, "", "", nil)
+		return c.newRequest(ctx, http.MethodGet, path, "", nil)
 	})
 	if err != nil {
 		return nil, err
@@ -407,10 +465,13 @@ func (c *Client) doVoid(ctx context.Context, method, path string) error {
 
 // insertConfig holds optional parameters for insert operations.
 type insertConfig struct {
-	tags      []string
-	chunkSize int
-	overlap   int
-	entityID  string
+	tags         []string
+	metadata     Metadata
+	chunkSize    int
+	overlap      int
+	entityID     string
+	source       string
+	extractFacts bool
 }
 
 // InsertOption configures an insert operation.
@@ -421,12 +482,10 @@ func WithTags(tags []string) InsertOption {
 	return func(c *insertConfig) { c.tags = tags }
 }
 
-// WithEntityID scopes the inserted (or updated) document to an owning entity —
-// a user, agent, tenant, or any identifier of your choosing. Scoped documents
-// can later be filtered at search time with WithSearchEntityID. Passes the
-// value as the entity_id query parameter. An empty id is ignored (unscoped).
-func WithEntityID(id string) InsertOption {
-	return func(c *insertConfig) { c.entityID = id }
+// WithMetadata sets structured metadata for the document. Values should be
+// strings, numbers, or booleans; timestamp metadata should use RFC 3339 strings.
+func WithMetadata(metadata Metadata) InsertOption {
+	return func(c *insertConfig) { c.metadata = metadata }
 }
 
 // WithChunking sets the chunk size and overlap for document splitting.
@@ -442,11 +501,60 @@ func WithChunking(chunkSize, overlap int) InsertOption {
 	}
 }
 
-// applyInsertParams adds tags, chunking, and entity scoping query parameters to
-// the URL values.
-func applyInsertParams(params url.Values, cfg insertConfig) {
+// WithEntityID associates the document with an entity (e.g. a user or
+// customer id). Documents can later be filtered by entity in list and search.
+func WithEntityID(id string) InsertOption {
+	return func(c *insertConfig) { c.entityID = id }
+}
+
+// WithSource labels the document's origin (e.g. "slack", "upload", "crawler").
+// Documents can later be filtered by source in list and search.
+func WithSource(s string) InsertOption {
+	return func(c *insertConfig) { c.source = s }
+}
+
+// WithExtractFacts requests server-side fact extraction: the inserted text is
+// distilled into atomic facts, each stored as a sibling document tagged
+// "kind:fact" and linked to this document. Requires fact extraction to be
+// configured on the node, otherwise the insert fails.
+func WithExtractFacts(enabled bool) InsertOption {
+	return func(c *insertConfig) { c.extractFacts = enabled }
+}
+
+func setJSONParam(params url.Values, key string, value any) error {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case Metadata:
+		if len(v) == 0 {
+			return nil
+		}
+	case MetadataFilter:
+		if len(v) == 0 {
+			return nil
+		}
+	}
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("aether: failed to encode %s: %w", key, err)
+	}
+	params.Set(key, string(payload))
+	return nil
+}
+
+// applyInsertParams adds tags, structured metadata, entity, source, and chunking query parameters to the URL values.
+func applyInsertParams(params url.Values, cfg insertConfig) error {
 	if len(cfg.tags) > 0 {
 		params.Set("tags", strings.Join(cfg.tags, ","))
+	}
+	if err := setJSONParam(params, "metadata", cfg.metadata); err != nil {
+		return err
+	}
+	if cfg.entityID != "" {
+		params.Set("entity_id", cfg.entityID)
+	}
+	if cfg.source != "" {
+		params.Set("source", cfg.source)
 	}
 	if cfg.chunkSize > 0 {
 		params.Set("chunk_size", fmt.Sprintf("%d", cfg.chunkSize))
@@ -454,67 +562,249 @@ func applyInsertParams(params url.Values, cfg insertConfig) {
 	if cfg.overlap > 0 {
 		params.Set("overlap", fmt.Sprintf("%d", cfg.overlap))
 	}
-	if cfg.entityID != "" {
-		params.Set("entity_id", cfg.entityID)
+	if cfg.extractFacts {
+		params.Set("extract_facts", "true")
 	}
+	return nil
 }
 
 // searchConfig holds optional parameters for search operations.
 type searchConfig struct {
-	tags        []string
-	maxDistance *float32
-	entityID    string
-	since       string
-	until       string
-	lastNDays   int
+	includeContent bool
+	tags           []string
+	anyTags        []string
+	contentTypes   []string
+	sources        []string
+	filter         MetadataFilter
+	entityID       string
+	since          string
+	until          string
+	lastNDays      int
+	maxDistance    float32
+	recencyWeight  float32
+	halfLifeDays   float32
+
+	freshnessWeight       float32
+	freshnessHalfLifeDays float32
 }
 
 // SearchOption configures a search operation.
 type SearchOption func(*searchConfig)
 
-// WithSearchTags filters search results by metadata tags.
+// WithIncludeContent requests document content inline in search results.
+func WithIncludeContent() SearchOption {
+	return func(c *searchConfig) { c.includeContent = true }
+}
+
+// WithSearchTags filters search results by metadata tags. A document must carry
+// ALL of the given tags to match (AND).
 func WithSearchTags(tags []string) SearchOption {
 	return func(c *searchConfig) { c.tags = tags }
 }
 
-// WithMaxDistance sets an optional relevance-distance ceiling. Results with
-// distance > max are dropped server-side. Smaller is stricter
-// (0.0 = exact match, ~1.0 = unrelated). Omit (do not pass this option) to
-// return the top-k regardless of distance — the historical behavior.
-func WithMaxDistance(max float32) SearchOption {
-	return func(c *searchConfig) { c.maxDistance = &max }
+// WithAnyTags filters search results to documents carrying AT LEAST ONE of the
+// given metadata tags (OR).
+func WithAnyTags(tags ...string) SearchOption {
+	return func(c *searchConfig) { c.anyTags = tags }
 }
 
-// WithSearchEntityID restricts results to documents scoped to the given entity
-// (see WithEntityID at insert time). Pass the value as the entity_id query
-// parameter. An empty id is ignored (search across all entities).
+// WithContentTypes filters search results to documents whose content type is any
+// one of the given values (OR), e.g. "application/pdf", "text/markdown".
+func WithContentTypes(contentTypes ...string) SearchOption {
+	return func(c *searchConfig) { c.contentTypes = contentTypes }
+}
+
+// WithSources filters search results to documents whose source is any one of the
+// given values (OR), e.g. "slack", "upload" (source is set at insert time via
+// WithSource).
+func WithSources(sources ...string) SearchOption {
+	return func(c *searchConfig) { c.sources = sources }
+}
+
+// WithMetadataFilter filters search results by structured metadata. Keys may be
+// "metadata.<key>" or bare metadata keys; values are equality shorthand or
+// operator objects using eq/ne/gt/lt/gte/lte/in.
+func WithMetadataFilter(filter MetadataFilter) SearchOption {
+	return func(c *searchConfig) { c.filter = filter }
+}
+
+// WithSearchEntityID filters search results to documents associated with the
+// given entity id (set at insert time via WithEntityID).
 func WithSearchEntityID(id string) SearchOption {
 	return func(c *searchConfig) { c.entityID = id }
 }
 
-// WithSince restricts results to documents created on or after the given
-// instant (inclusive). Takes an RFC 3339 timestamp ("2026-06-01T00:00:00Z");
-// sent as the since query parameter. An empty value is ignored (no lower bound).
-func WithSince(since string) SearchOption {
-	return func(c *searchConfig) { c.since = since }
+// WithSince filters search results to documents created at or after the given
+// RFC 3339 timestamp (e.g. "2026-06-01T00:00:00Z"). The bound is inclusive.
+func WithSince(ts string) SearchOption {
+	return func(c *searchConfig) { c.since = ts }
 }
 
-// WithUntil restricts results to documents created on or before the given
-// instant (inclusive). Takes an RFC 3339 timestamp; sent as the until query
-// parameter. An empty value is ignored (no upper bound).
-func WithUntil(until string) SearchOption {
-	return func(c *searchConfig) { c.until = until }
+// WithUntil filters search results to documents created at or before the given
+// RFC 3339 timestamp (e.g. "2026-06-30T23:59:59Z"). The bound is inclusive.
+func WithUntil(ts string) SearchOption {
+	return func(c *searchConfig) { c.until = ts }
 }
 
-// WithLastNDays restricts results to documents created within the last n days
-// (server-side shorthand for since = now - n days, UTC). Sent as the integer
-// last_n_days query parameter; cannot be combined with WithSince server-side. A
-// non-positive n is ignored.
+// WithLastNDays filters search results to documents created within the last
+// n days (server clock, UTC). It cannot be combined with WithSince but may be
+// combined with WithUntil. n must be >= 1; invalid values are ignored.
 func WithLastNDays(n int) SearchOption {
 	return func(c *searchConfig) {
 		if n > 0 {
 			c.lastNDays = n
 		}
+	}
+}
+
+// WithMaxDistance sets an optional relevance-distance ceiling: results whose
+// distance from the query exceeds d are dropped server-side. Smaller is
+// stricter (0.0 = exact match, ~1.0 = unrelated). d must be > 0; invalid
+// values are ignored (top-k returned regardless of distance).
+func WithMaxDistance(d float32) SearchOption {
+	return func(c *searchConfig) {
+		if d > 0 {
+			c.maxDistance = d
+		}
+	}
+}
+
+// WithRecency blends server-side recency into the result ranking. weight is the
+// recency_weight in [0, 1] (0 = pure relevance, 1 = strongly favor recent
+// documents) and is forwarded as recency_weight. halfLifeDays is the recency
+// decay half-life in days; pass <= 0 to leave it at the server default (30
+// days), in which case only recency_weight is sent. weight is clamped to [0, 1].
+//
+// A combined option keeps the two recency knobs together (the server treats them
+// as a pair) and avoids colliding with the Memory facade's client-side
+// WithRecencyWeight RecallOption.
+func WithRecency(weight, halfLifeDays float32) SearchOption {
+	return func(c *searchConfig) {
+		if weight < 0 {
+			weight = 0
+		} else if weight > 1 {
+			weight = 1
+		}
+		c.recencyWeight = weight
+		if halfLifeDays > 0 {
+			c.halfLifeDays = halfLifeDays
+		}
+	}
+}
+
+// WithHalfLifeDays sets the recency decay half-life (in days) for recency-blended
+// ranking, forwarded as half_life_days. It is only meaningful together with a
+// positive recency weight (see WithRecency); on its own it sets the half-life the
+// server would use once recency is enabled. h must be > 0; invalid values are
+// ignored.
+func WithHalfLifeDays(h float32) SearchOption {
+	return func(c *searchConfig) {
+		if h > 0 {
+			c.halfLifeDays = h
+		}
+	}
+}
+
+// WithFreshness blends server-side freshness into the result ranking, boosting
+// documents that were recently updated (updated_at, falling back to created_at
+// for never-updated documents). weight is the freshness_weight in [0, 1]
+// (0 = pure relevance, 1 = strongly favor freshly updated documents) and is
+// forwarded as freshness_weight. halfLifeDays is the freshness decay half-life
+// in days; pass <= 0 to leave it at the server default (14 days), in which case
+// only freshness_weight is sent. weight is clamped to [0, 1].
+//
+// Freshness composes with WithRecency; the server rejects a combined
+// recency + freshness weight above 1. May require a Scale plan or higher.
+func WithFreshness(weight, halfLifeDays float32) SearchOption {
+	return func(c *searchConfig) {
+		if weight < 0 {
+			weight = 0
+		} else if weight > 1 {
+			weight = 1
+		}
+		c.freshnessWeight = weight
+		if halfLifeDays > 0 {
+			c.freshnessHalfLifeDays = halfLifeDays
+		}
+	}
+}
+
+// WithFreshnessHalfLifeDays sets the freshness decay half-life (in days) for
+// freshness-blended ranking, forwarded as freshness_half_life_days. It is only
+// meaningful together with a positive freshness weight (see WithFreshness); on
+// its own it sets the half-life the server would use once freshness is enabled.
+// h must be > 0; invalid values are ignored.
+func WithFreshnessHalfLifeDays(h float32) SearchOption {
+	return func(c *searchConfig) {
+		if h > 0 {
+			c.freshnessHalfLifeDays = h
+		}
+	}
+}
+
+// joinCSV comma-joins a slice for the wire, returning the empty string for an
+// empty slice so omitempty fields are dropped from the request body.
+func joinCSV(vals []string) string {
+	if len(vals) == 0 {
+		return ""
+	}
+	return strings.Join(vals, ",")
+}
+
+// applySearchParams adds entity, metadata-facet, and time-window filter query
+// parameters to the URL values. Zero values are treated as unset and omitted.
+// The OR-list facets (any_tags, content_type, source) are comma-joined, the
+// same CSV convention used for tags.
+func applySearchParams(params url.Values, cfg searchConfig) error {
+	if len(cfg.anyTags) > 0 {
+		params.Set("any_tags", strings.Join(cfg.anyTags, ","))
+	}
+	if len(cfg.contentTypes) > 0 {
+		params.Set("content_type", strings.Join(cfg.contentTypes, ","))
+	}
+	if len(cfg.sources) > 0 {
+		params.Set("source", strings.Join(cfg.sources, ","))
+	}
+	if err := setJSONParam(params, "filter", cfg.filter); err != nil {
+		return err
+	}
+	if cfg.entityID != "" {
+		params.Set("entity_id", cfg.entityID)
+	}
+	if cfg.since != "" {
+		params.Set("since", cfg.since)
+	}
+	if cfg.until != "" {
+		params.Set("until", cfg.until)
+	}
+	if cfg.lastNDays > 0 {
+		params.Set("last_n_days", fmt.Sprintf("%d", cfg.lastNDays))
+	}
+	if cfg.maxDistance > 0 {
+		params.Set("max_distance", strconv.FormatFloat(float64(cfg.maxDistance), 'f', -1, 32))
+	}
+	if cfg.recencyWeight > 0 {
+		params.Set("recency_weight", strconv.FormatFloat(float64(cfg.recencyWeight), 'f', -1, 32))
+	}
+	if cfg.halfLifeDays > 0 {
+		params.Set("half_life_days", strconv.FormatFloat(float64(cfg.halfLifeDays), 'f', -1, 32))
+	}
+	if cfg.freshnessWeight > 0 {
+		params.Set("freshness_weight", strconv.FormatFloat(float64(cfg.freshnessWeight), 'f', -1, 32))
+	}
+	if cfg.freshnessHalfLifeDays > 0 {
+		params.Set("freshness_half_life_days", strconv.FormatFloat(float64(cfg.freshnessHalfLifeDays), 'f', -1, 32))
+	}
+	return nil
+}
+
+// applyPartitionParam adds the handle's partition to the query params when the
+// client is scoped. An empty (unscoped) partition is omitted, so an unscoped
+// client sends exactly what it sent before. The value is encoded by
+// url.Values.Encode the same way entity_id is.
+func (c *Client) applyPartitionParam(params url.Values) {
+	if c.partition != "" {
+		params.Set("partition", c.partition)
 	}
 }
 
@@ -562,7 +852,10 @@ func (c *Client) Insert(ctx context.Context, data []byte, filename, contentType 
 		"filename":     {filename},
 		"content_type": {contentType},
 	}
-	applyInsertParams(params, cfg)
+	if err := applyInsertParams(params, cfg); err != nil {
+		return nil, err
+	}
+	c.applyPartitionParam(params)
 	var doc DocumentRecord
 	err := c.doJSON(ctx, http.MethodPost, "/documents?"+params.Encode(), bytes.NewReader(data), &doc)
 	if err != nil {
@@ -591,14 +884,21 @@ func (c *Client) InsertStream(ctx context.Context, r io.Reader, filename, conten
 		"filename":     {filename},
 		"content_type": {contentType},
 	}
-	// Tags and entity scoping apply to streams; chunking does not (server
-	// handles stream chunking).
+	// Tags, entity association, and source apply to streams; chunking does not
+	// (server handles stream chunking).
 	if len(cfg.tags) > 0 {
 		params.Set("tags", strings.Join(cfg.tags, ","))
 	}
 	if cfg.entityID != "" {
 		params.Set("entity_id", cfg.entityID)
 	}
+	if cfg.source != "" {
+		params.Set("source", cfg.source)
+	}
+	if err := setJSONParam(params, "metadata", cfg.metadata); err != nil {
+		return nil, err
+	}
+	c.applyPartitionParam(params)
 	var doc DocumentRecord
 	err := c.doJSONNoRetry(ctx, http.MethodPost, "/documents?"+params.Encode(), r, &doc)
 	if err != nil {
@@ -638,7 +938,10 @@ func (c *Client) Update(ctx context.Context, docID string, data []byte, filename
 		"filename":     {filename},
 		"content_type": {contentType},
 	}
-	applyInsertParams(params, cfg)
+	if err := applyInsertParams(params, cfg); err != nil {
+		return nil, err
+	}
+	c.applyPartitionParam(params)
 	var doc DocumentRecord
 	err := c.doJSON(ctx, http.MethodPut,
 		"/documents/"+url.PathEscape(docID)+"?"+params.Encode(),
@@ -683,25 +986,38 @@ func (c *Client) DownloadText(ctx context.Context, docID string) (string, error)
 }
 
 // ListOptions configures pagination and filtering for the List operation.
+// Zero-value fields are treated as unset and omitted from the request.
 type ListOptions struct {
 	// Offset is the number of documents to skip (for pagination). Default: 0.
 	Offset int
 	// Limit is the maximum number of documents to return. Default: 50.
 	Limit int
-	// EntityID restricts the listing to documents scoped to the given entity.
-	// Empty lists across all entities.
+	// EntityID filters the listing to documents associated with the given
+	// entity id (set at insert time via WithEntityID).
 	EntityID string
-	// Since restricts the listing to documents created at or after the given
-	// instant. Accepts an RFC 3339 timestamp or a relative window (e.g. "7d").
-	// Empty applies no lower bound.
+	// Tags filters the listing to documents carrying ALL of these metadata
+	// tags (AND).
+	Tags []string
+	// AnyTags filters the listing to documents carrying AT LEAST ONE of these
+	// metadata tags (OR).
+	AnyTags []string
+	// ContentTypes filters the listing to documents whose content type is any
+	// one of these values (OR).
+	ContentTypes []string
+	// Sources filters the listing to documents whose source is any one of these
+	// values (OR), where source is set at insert time via WithSource.
+	Sources []string
+	// Filter is a structured metadata filter with equality or operator predicates.
+	Filter MetadataFilter
+	// Since filters the listing to documents created at or after this
+	// RFC 3339 timestamp (e.g. "2026-06-01T00:00:00Z"). The bound is inclusive.
 	Since string
-	// Until restricts the listing to documents created at or before the given
-	// instant. Accepts an RFC 3339 timestamp or a relative window (e.g. "7d").
-	// Empty applies no upper bound.
+	// Until filters the listing to documents created at or before this
+	// RFC 3339 timestamp. The bound is inclusive.
 	Until string
-	// LastNDays restricts the listing to documents created within the last n
-	// days, sent as a relative since window ("<n>d"). When > 0 it takes
-	// precedence over Since. Non-positive values are ignored.
+	// LastNDays filters the listing to documents created within the last
+	// N days (server clock, UTC). It cannot be combined with Since but may
+	// be combined with Until.
 	LastNDays int
 }
 
@@ -729,17 +1045,32 @@ func (c *Client) List(ctx context.Context, opts *ListOptions) (*ListResult, erro
 		if opts.EntityID != "" {
 			params.Set("entity_id", opts.EntityID)
 		}
-		// last_n_days and since are mutually exclusive server-side; prefer
-		// last_n_days when set. Both are integers/RFC-3339 respectively.
-		if opts.LastNDays > 0 {
-			params.Set("last_n_days", strconv.Itoa(opts.LastNDays))
-		} else if opts.Since != "" {
+		if len(opts.Tags) > 0 {
+			params.Set("tags", strings.Join(opts.Tags, ","))
+		}
+		if len(opts.AnyTags) > 0 {
+			params.Set("any_tags", strings.Join(opts.AnyTags, ","))
+		}
+		if len(opts.ContentTypes) > 0 {
+			params.Set("content_type", strings.Join(opts.ContentTypes, ","))
+		}
+		if len(opts.Sources) > 0 {
+			params.Set("source", strings.Join(opts.Sources, ","))
+		}
+		if err := setJSONParam(params, "filter", opts.Filter); err != nil {
+			return nil, err
+		}
+		if opts.Since != "" {
 			params.Set("since", opts.Since)
 		}
 		if opts.Until != "" {
 			params.Set("until", opts.Until)
 		}
+		if opts.LastNDays > 0 {
+			params.Set("last_n_days", fmt.Sprintf("%d", opts.LastNDays))
+		}
 	}
+	c.applyPartitionParam(params)
 	path := "/documents"
 	if len(params) > 0 {
 		path += "?" + params.Encode()
@@ -757,12 +1088,24 @@ func (c *Client) List(ctx context.Context, opts *ListOptions) (*ListResult, erro
 	return &ListResult{Documents: resp.Documents, Total: resp.Total, HasMore: resp.HasMore}, nil
 }
 
-// Delete tombstones a document.
+// Delete tombstones a document (soft delete): it is hidden from list/search and
+// can be brought back with Restore.
 func (c *Client) Delete(ctx context.Context, docID string) error {
 	if docID == "" {
 		return fmt.Errorf("aether: docID cannot be empty")
 	}
 	return c.doVoid(ctx, http.MethodDelete, "/documents/"+url.PathEscape(docID))
+}
+
+// HardDelete permanently purges a document: it is removed from the primary
+// store and both the vector and keyword indexes, and its encryption key
+// is shredded. This is irreversible — nothing is recoverable afterwards (the
+// right-to-be-forgotten path). Use Delete for a recoverable tombstone.
+func (c *Client) HardDelete(ctx context.Context, docID string) error {
+	if docID == "" {
+		return fmt.Errorf("aether: docID cannot be empty")
+	}
+	return c.doVoid(ctx, http.MethodDelete, "/documents/"+url.PathEscape(docID)+"?hard=true")
 }
 
 // Restore un-tombstones a document.
@@ -773,32 +1116,46 @@ func (c *Client) Restore(ctx context.Context, docID string) error {
 	return c.doVoid(ctx, http.MethodPost, "/documents/"+url.PathEscape(docID)+"/restore")
 }
 
-// BackfillEntityFromTags derives an entity_id for existing documents from their
-// metadata tags. For every active document carrying a tag that begins with
-// tagPrefix, the server sets entity_id to the remainder of that tag (the tag
-// value with tagPrefix stripped). This is a one-shot migration helper for
-// collections that encoded ownership in tags before entity scoping existed.
-//
-// When overwrite is false, documents that already have an entity_id are left
-// untouched; when true, their entity_id is replaced with the tag-derived value.
-// The returned EntityBackfillReport accounts for every document the server
-// considered. tagPrefix must not be empty.
+// BackfillEntityFromTags backfills entity_id on the tenant's existing documents
+// from a tag convention. For every active document, a tag starting with
+// tagPrefix (e.g. "patient:") sets entity_id to the suffix after the prefix when
+// exactly one such tag exists; ambiguous (2+) or absent matches are skipped.
+// Documents that already have an entity_id are left alone unless overwrite is
+// true. This is a metadata-only operation: documents are not re-embedded.
+// It returns an EntityBackfillReport summarizing how documents were classified.
 func (c *Client) BackfillEntityFromTags(ctx context.Context, tagPrefix string, overwrite bool) (*EntityBackfillReport, error) {
 	if tagPrefix == "" {
 		return nil, fmt.Errorf("aether: tagPrefix cannot be empty")
 	}
-	payload, err := json.Marshal(entityBackfillRequest{TagPrefix: tagPrefix, Overwrite: overwrite})
+	payload, err := json.Marshal(backfillEntityRequest{
+		TagPrefix: tagPrefix,
+		Overwrite: overwrite,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("aether: failed to encode request: %w", err)
 	}
 	var report EntityBackfillReport
-	if err := c.doJSONCT(ctx, http.MethodPost, "/documents/backfill-entity", "application/json", bytes.NewReader(payload), &report); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, "/documents/backfill-entity", bytes.NewReader(payload), &report); err != nil {
 		return nil, err
 	}
 	return &report, nil
 }
 
 // ── Search ────────────────────────────────────────────────────────
+
+// stampQueryID copies the response-level usage-feedback query_id (present only
+// when feedback capture is enabled for the tenant) onto every hit, so a caller
+// can pass any hit's QueryID straight to SendSearchFeedback. A nil queryID
+// (feedback capture disabled) leaves every hit's QueryID nil — the tolerant
+// path for servers that don't send the field.
+func stampQueryID(results []SearchResult, queryID *string) {
+	if queryID == nil {
+		return
+	}
+	for i := range results {
+		results[i].QueryID = queryID
+	}
+}
 
 // Search performs a similarity search across documents.
 func (c *Client) Search(ctx context.Context, query string, k int, opts ...SearchOption) ([]SearchResult, error) {
@@ -816,37 +1173,59 @@ func (c *Client) Search(ctx context.Context, query string, k int, opts ...Search
 		"q": {query},
 		"k": {fmt.Sprintf("%d", k)},
 	}
+	if cfg.includeContent {
+		params.Set("include_content", "true")
+	}
 	if len(cfg.tags) > 0 {
 		params.Set("tags", strings.Join(cfg.tags, ","))
 	}
-	if cfg.maxDistance != nil {
-		params.Set("max_distance", strconv.FormatFloat(float64(*cfg.maxDistance), 'g', -1, 32))
+	if err := applySearchParams(params, cfg); err != nil {
+		return nil, err
 	}
-	if cfg.entityID != "" {
-		params.Set("entity_id", cfg.entityID)
-	}
-	// last_n_days and since are mutually exclusive server-side; prefer
-	// last_n_days when set.
-	if cfg.lastNDays > 0 {
-		params.Set("last_n_days", strconv.Itoa(cfg.lastNDays))
-	} else if cfg.since != "" {
-		params.Set("since", cfg.since)
-	}
-	if cfg.until != "" {
-		params.Set("until", cfg.until)
-	}
+	c.applyPartitionParam(params)
 	var resp searchResponse
 	err := c.doJSON(ctx, http.MethodGet, "/search?"+params.Encode(), nil, &resp)
 	if err != nil {
 		return nil, err
 	}
+	stampQueryID(resp.Results, resp.QueryID)
 	return resp.Results, nil
 }
 
-// Retrieve performs a search and returns results enriched with full document
-// content for RAG workflows. Results are deduplicated by DocID (closest match
-// wins). Search no longer returns document content inline, so each unique
-// document's full text is fetched by ID and attached as Content.
+// SendSearchFeedback reports how a search result was actually used, tying
+// retrieval quality back to real outcomes. signal is one of "used" (the hit
+// informed the answer), "cited" (quoted/referenced directly), or "ignored"
+// (retrieved but unused).
+//
+// Requires usage-feedback capture to be enabled for your tenant; search
+// results then carry a QueryID to pass here (nil otherwise). The server
+// rejects an unknown queryID with 404 and an invalid signal with 400 (both
+// surface as *APIError).
+func (c *Client) SendSearchFeedback(ctx context.Context, queryID, docID, signal string) error {
+	if queryID == "" {
+		return fmt.Errorf("aether: queryID cannot be empty")
+	}
+	if docID == "" {
+		return fmt.Errorf("aether: docID cannot be empty")
+	}
+	if signal == "" {
+		return fmt.Errorf("aether: signal cannot be empty")
+	}
+	payload, err := json.Marshal(searchFeedbackRequest{
+		QueryID: queryID,
+		DocID:   docID,
+		Signal:  signal,
+	})
+	if err != nil {
+		return fmt.Errorf("aether: failed to encode request: %w", err)
+	}
+	return c.doJSON(ctx, http.MethodPost, "/search/feedback", bytes.NewReader(payload), nil)
+}
+
+// Retrieve performs a search and returns results enriched with document content.
+// Results are deduplicated by DocID (highest-scoring match wins). Content is
+// returned inline when the server supports it; otherwise it falls back to
+// downloading each unique document's text by ID.
 func (c *Client) Retrieve(ctx context.Context, query string, k int, opts ...SearchOption) ([]RetrievalResult, error) {
 	if query == "" {
 		return nil, fmt.Errorf("aether: query cannot be empty")
@@ -854,12 +1233,15 @@ func (c *Client) Retrieve(ctx context.Context, query string, k int, opts ...Sear
 	if k < 1 {
 		return nil, fmt.Errorf("aether: k must be at least 1")
 	}
-	results, err := c.Search(ctx, query, k, opts...)
+	// Always request inline content to avoid extra downloads when possible.
+	searchOpts := append([]SearchOption{WithIncludeContent()}, opts...)
+	results, err := c.Search(ctx, query, k, searchOpts...)
 	if err != nil {
 		return nil, err
 	}
 
-	// Deduplicate by DocID, keeping the closest match
+	// Deduplicate by DocID, keeping the best match (search returns
+	// highest-scoring first).
 	seen := make(map[string]SearchResult)
 	var unique []SearchResult
 	for _, r := range results {
@@ -871,11 +1253,15 @@ func (c *Client) Retrieve(ctx context.Context, query string, k int, opts ...Sear
 
 	out := make([]RetrievalResult, 0, len(unique))
 	for _, r := range unique {
-		// Search returns only the matched passage now (never full document
-		// content), so fetch each unique document's text by ID for RAG prompts.
-		content, err := c.DownloadText(ctx, r.DocID)
-		if err != nil {
-			return nil, fmt.Errorf("aether: failed to download doc %s: %w", r.DocID, err)
+		var content string
+		if r.Content != nil {
+			content = *r.Content
+		} else {
+			downloaded, err := c.DownloadText(ctx, r.DocID)
+			if err != nil {
+				return nil, fmt.Errorf("aether: failed to download doc %s: %w", r.DocID, err)
+			}
+			content = downloaded
 		}
 		out = append(out, RetrievalResult{
 			DocID:       r.DocID,
@@ -885,9 +1271,123 @@ func (c *Client) Retrieve(ctx context.Context, query string, k int, opts ...Sear
 			EntityID:    r.EntityID,
 			ContentType: r.ContentType,
 			Passage:     r.Passage,
+			Tags:        r.Tags,
+			Source:      r.Source,
+			Metadata:    r.Metadata,
+			CreatedAt:   r.CreatedAt,
+			UpdatedAt:   r.UpdatedAt,
 		})
 	}
 	return out, nil
+}
+
+// SearchTrace is like Search, but additionally returns evidence of which
+// partition(s) the query actually touched. The trace is computed from the
+// records the query returned, so it is evidence — not intent. Under a
+// partition handle the scope is injected exactly as in Search; the trace then
+// shows the boundary held (PartitionsTouched is empty or [ScopedTo], and
+// CandidatesInScope is the partition's own size).
+func (c *Client) SearchTrace(ctx context.Context, query string, k int, opts ...SearchOption) (*TracedSearch, error) {
+	if query == "" {
+		return nil, fmt.Errorf("aether: query cannot be empty")
+	}
+	if k < 1 {
+		return nil, fmt.Errorf("aether: k must be at least 1")
+	}
+	var cfg searchConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+	params := url.Values{
+		"q":     {query},
+		"k":     {fmt.Sprintf("%d", k)},
+		"trace": {"true"},
+	}
+	if cfg.includeContent {
+		params.Set("include_content", "true")
+	}
+	if len(cfg.tags) > 0 {
+		params.Set("tags", strings.Join(cfg.tags, ","))
+	}
+	if err := applySearchParams(params, cfg); err != nil {
+		return nil, err
+	}
+	c.applyPartitionParam(params)
+	var resp tracedSearchResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/search?"+params.Encode(), nil, &resp); err != nil {
+		return nil, err
+	}
+	stampQueryID(resp.Results, resp.QueryID)
+	return &TracedSearch{Results: resp.Results, Trace: resp.Trace}, nil
+}
+
+// VerifyIsolation self-tests that a scoped search never leaks out of this
+// partition. It runs SearchTrace under the handle's partition and checks that
+// every returned record stayed in scope: OK is true iff nothing leaked.
+//
+// It is only valid on a partition handle — calling it on an unscoped client
+// returns an error. It is only meaningful for a query that returns results; a
+// 0-result query passes vacuously (Results == 0). Drop one line into your own
+// tests to prove isolation against your data:
+//
+//	check, err := client.Partition("client-42").VerifyIsolation(ctx, "returns policy")
+//	// then assert check.OK
+func (c *Client) VerifyIsolation(ctx context.Context, query string) (*IsolationCheck, error) {
+	if c.partition == "" {
+		return nil, fmt.Errorf("aether: VerifyIsolation requires a partition handle — call client.Partition(id).VerifyIsolation(...)")
+	}
+	traced, err := c.SearchTrace(ctx, query, 10)
+	if err != nil {
+		return nil, err
+	}
+	scoped := c.partition
+	leaked := make([]string, 0)
+	for _, p := range traced.Trace.PartitionsTouched {
+		if p != scoped {
+			leaked = append(leaked, p)
+		}
+	}
+	ok := len(leaked) == 0 && !traced.Trace.DefaultPartitionTouched
+	scopedCopy := scoped
+	return &IsolationCheck{
+		OK:                ok,
+		ScopedTo:          &scopedCopy,
+		PartitionsTouched: traced.Trace.PartitionsTouched,
+		Results:           traced.Trace.Results,
+		CandidatesInScope: traced.Trace.CandidatesInScope,
+		Leaked:            leaked,
+	}, nil
+}
+
+// ── Partitions ────────────────────────────────────────────────────
+
+// ListPartitions lists this tenant's partitions with their active document
+// counts. It is tenant-level and does not use the partition handle. The result
+// includes advisory warnings flagging likely typos or ghost partitions; the
+// default (unkeyed) partition is not listed.
+func (c *Client) ListPartitions(ctx context.Context) (*PartitionList, error) {
+	var list PartitionList
+	if err := c.doJSON(ctx, http.MethodGet, "/partitions", nil, &list); err != nil {
+		return nil, err
+	}
+	return &list, nil
+}
+
+// DeletePartition deletes a partition and shreds every document in it (active
+// and tombstoned) in a single call — the one-call client-offboarding teardown.
+// It is tenant-level and names the target explicitly, so it does not use the
+// partition handle. It returns the number of documents deleted. It is
+// idempotent: deleting an unknown or empty partition returns 0 and is never an
+// error.
+func (c *Client) DeletePartition(ctx context.Context, partitionID string) (int, error) {
+	if err := validatePartition(partitionID); err != nil {
+		return 0, err
+	}
+	var resp partitionDeleteResponse
+	if err := c.doJSON(ctx, http.MethodDelete, "/partitions/"+url.PathEscape(partitionID), nil, &resp); err != nil {
+		return 0, err
+	}
+	return resp.DocumentsDeleted, nil
 }
 
 // InsertWithEmbeddings uploads a document with precomputed embeddings (BYOE).
@@ -902,14 +1402,21 @@ func (c *Client) InsertWithEmbeddings(ctx context.Context, content string, opts 
 		Filename:    opts.Filename,
 		ContentType: opts.ContentType,
 		Tags:        opts.Tags,
-		EntityID:    opts.EntityID,
+		Metadata:    opts.Metadata,
+		Partition:   c.partition,
+	}
+	if opts.EntityID != "" {
+		body.EntityID = &opts.EntityID
+	}
+	if opts.Source != "" {
+		body.Source = &opts.Source
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("aether: failed to encode request: %w", err)
 	}
 	var doc DocumentRecord
-	if err := c.doJSONCT(ctx, http.MethodPost, "/documents/embed", "application/json", bytes.NewReader(payload), &doc); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, "/documents/embed", bytes.NewReader(payload), &doc); err != nil {
 		return nil, err
 	}
 	return &doc, nil
@@ -928,23 +1435,36 @@ func (c *Client) SearchByVector(ctx context.Context, embedding []float32, k int,
 		o(&cfg)
 	}
 	body := vectorSearchRequest{
-		Embedding:   embedding,
-		K:           k,
-		Tags:        cfg.tags,
-		MaxDistance: cfg.maxDistance,
-		EntityID:    cfg.entityID,
-		Since:       cfg.since,
-		Until:       cfg.until,
-		LastNDays:   cfg.lastNDays,
+		Embedding:      embedding,
+		K:              k,
+		IncludeContent: cfg.includeContent,
+		Tags:           cfg.tags,
+		AnyTags:        cfg.anyTags,
+		ContentType:    cfg.contentTypes,
+		Source:         cfg.sources,
+		EntityID:       cfg.entityID,
+		Since:          cfg.since,
+		Until:          cfg.until,
+		LastNDays:      cfg.lastNDays,
+		MaxDistance:    cfg.maxDistance,
+		RecencyWeight:  cfg.recencyWeight,
+		HalfLifeDays:   cfg.halfLifeDays,
+
+		FreshnessWeight:       cfg.freshnessWeight,
+		FreshnessHalfLifeDays: cfg.freshnessHalfLifeDays,
+
+		Filter:    cfg.filter,
+		Partition: c.partition,
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("aether: failed to encode request: %w", err)
 	}
 	var resp searchResponse
-	if err := c.doJSONCT(ctx, http.MethodPost, "/search/embed", "application/json", bytes.NewReader(payload), &resp); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, "/search/embed", bytes.NewReader(payload), &resp); err != nil {
 		return nil, err
 	}
+	stampQueryID(resp.Results, resp.QueryID)
 	return resp.Results, nil
 }
 
@@ -969,7 +1489,10 @@ func (c *Client) InsertAsync(ctx context.Context, data []byte, filename, content
 		"filename":     {filename},
 		"content_type": {contentType},
 	}
-	applyInsertParams(params, cfg)
+	if err := applyInsertParams(params, cfg); err != nil {
+		return nil, err
+	}
+	c.applyPartitionParam(params)
 	var result AsyncJobResult
 	err := c.doJSON(ctx, http.MethodPost, "/documents/async?"+params.Encode(), bytes.NewReader(data), &result)
 	if err != nil {
@@ -1021,16 +1544,20 @@ func (c *Client) BatchInsert(ctx context.Context, documents []BatchInsertItem, o
 	for _, o := range opts {
 		o(&cfg)
 	}
-	wireDocs := make([]batchInsertItemWire, len(documents))
+	items := make([]batchInsertItemWire, len(documents))
 	for i, d := range documents {
-		wireDocs[i] = batchInsertItemWire{
-			Filename: d.Filename,
-			Content:  d.Content,
-			Tags:     strings.Join(d.Tags, ","),
+		items[i] = batchInsertItemWire{
+			Filename:  d.Filename,
+			Content:   d.Content,
+			Tags:      joinCSV(d.Tags),
+			EntityID:  d.EntityID,
+			Source:    d.Source,
+			Metadata:  d.Metadata,
+			Partition: c.partition,
 		}
 	}
 	payload := batchInsertRequest{
-		Documents: wireDocs,
+		Documents: items,
 	}
 	if cfg.chunkSize > 0 {
 		payload.ChunkSize = &cfg.chunkSize
@@ -1043,41 +1570,59 @@ func (c *Client) BatchInsert(ctx context.Context, documents []BatchInsertItem, o
 		return nil, fmt.Errorf("aether: failed to encode request: %w", err)
 	}
 	var resp batchInsertResponse
-	if err := c.doJSONCT(ctx, http.MethodPost, "/documents/batch", "application/json", bytes.NewReader(data), &resp); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, "/documents/batch", bytes.NewReader(data), &resp); err != nil {
 		return nil, err
 	}
 	return resp.Results, nil
 }
 
 // BatchSearch performs multiple similarity search queries in a single request.
-// Each query can specify its own k and tags.
+// Each query can specify its own k, tags, and include_content settings.
 // Returns one BatchSearchResponse per input query, in the same order.
 func (c *Client) BatchSearch(ctx context.Context, queries []BatchSearchQuery) ([]BatchSearchResponse, error) {
 	if len(queries) == 0 {
 		return nil, fmt.Errorf("aether: queries cannot be empty")
 	}
-	wireQueries := make([]batchSearchQueryWire, len(queries))
+	wire := make([]batchSearchQueryWire, len(queries))
 	for i, q := range queries {
-		wireQueries[i] = batchSearchQueryWire{
-			Q:           q.Q,
-			K:           q.K,
-			Tags:        strings.Join(q.Tags, ","),
-			MaxDistance: q.MaxDistance,
-			EntityID:    q.EntityID,
-			Since:       q.Since,
-			Until:       q.Until,
-			LastNDays:   q.LastNDays,
+		wire[i] = batchSearchQueryWire{
+			Q:              q.Q,
+			K:              q.K,
+			Tags:           joinCSV(q.Tags),
+			AnyTags:        joinCSV(q.AnyTags),
+			ContentType:    joinCSV(q.ContentTypes),
+			Source:         joinCSV(q.Sources),
+			Filter:         q.Filter,
+			IncludeContent: q.IncludeContent,
+			EntityID:       q.EntityID,
+			Since:          q.Since,
+			Until:          q.Until,
+			LastNDays:      q.LastNDays,
+			MaxDistance:    q.MaxDistance,
+			RecencyWeight:  q.RecencyWeight,
+			HalfLifeDays:   q.HalfLifeDays,
+
+			FreshnessWeight:       q.FreshnessWeight,
+			FreshnessHalfLifeDays: q.FreshnessHalfLifeDays,
+
+			Partition: c.partition,
 		}
 	}
-	payload, err := json.Marshal(batchSearchRequest{Queries: wireQueries})
+	payload, err := json.Marshal(batchSearchRequest{Queries: wire})
 	if err != nil {
 		return nil, fmt.Errorf("aether: failed to encode request: %w", err)
 	}
 	var resp batchSearchResponseWrapper
-	if err := c.doJSONCT(ctx, http.MethodPost, "/search/batch", "application/json", bytes.NewReader(payload), &resp); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, "/search/batch", bytes.NewReader(payload), &resp); err != nil {
 		return nil, err
 	}
-	return resp.Results, nil
+	// The feedback handle arrives per query; stamp it onto that query's hits.
+	out := make([]BatchSearchResponse, len(resp.Results))
+	for i, r := range resp.Results {
+		stampQueryID(r.Results, r.QueryID)
+		out[i] = BatchSearchResponse{Query: r.Query, Results: r.Results}
+	}
+	return out, nil
 }
 
 // ── Cluster ───────────────────────────────────────────────────────

@@ -25,6 +25,13 @@ const (
 	// paused a tenant via the spike detector or admin console. Not
 	// retryable; the tenant must be un-paused out-of-band.
 	CodeTenantPaused = "tenant_paused"
+
+	// CodePartitionRequired is returned with HTTP 400 when a multi-tenant key
+	// makes a call without naming a partition. The key requires every
+	// read/write to be scoped; scope the call through Partition("<id>")
+	// instead of the top-level client. Not retryable — it is a programming
+	// error, not a transient failure.
+	CodePartitionRequired = "partition_required"
 )
 
 // Sentinel errors. Use with errors.Is to branch on the specific failure
@@ -35,6 +42,9 @@ var (
 	ErrCreditExhausted   = errors.New("aether: credit exhausted")
 	ErrFreeLimitExceeded = errors.New("aether: free plan limit exceeded")
 	ErrTenantPaused      = errors.New("aether: tenant paused by operator")
+	// ErrPartitionRequired matches a 400 from a multi-tenant key that made an
+	// unscoped call. Scope the call through Partition("<id>") and retry.
+	ErrPartitionRequired = errors.New("aether: partition required — scope the call through Partition(id)")
 )
 
 // APIError is returned when the Aether API responds with a non-2xx status code.
@@ -64,6 +74,8 @@ func (e *APIError) Is(target error) bool {
 		return e.ErrorCode == CodeFreeLimitExceeded
 	case ErrTenantPaused:
 		return e.ErrorCode == CodeTenantPaused
+	case ErrPartitionRequired:
+		return e.ErrorCode == CodePartitionRequired
 	}
 	return false
 }

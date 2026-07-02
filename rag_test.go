@@ -5,8 +5,6 @@ import (
 	"testing"
 )
 
-func ptr(s string) *string { return &s }
-
 func makeResult(opts ...func(*RetrievalResult)) RetrievalResult {
 	r := RetrievalResult{
 		DocID:   "d1",

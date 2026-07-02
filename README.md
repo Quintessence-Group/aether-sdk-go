@@ -46,8 +46,9 @@ func main() {
 
 - `Recall(ctx, query, WithRecallK(5), WithRecencyWeight(0.0), WithRecallSince(...), WithRecallUntil(...))`
   blends relevance (a calibrated `score`, 0–100) with optional exponential recency decay.
-- `Remember(ctx, text, metadata)` stores the memory and writes `metadata` (a
-  `map[string]string`) as searchable `key:value` tags.
+- `Remember(ctx, text, metadata)` stores the memory and attaches `metadata` as
+  structured metadata; string-safe entries are also mirrored into searchable
+  `key:value` tags.
 - `Forget(ctx, id)` deletes one memory; `ForgetAll(ctx)` clears the entity.
 
 The raw `Client` below is the lower-level API — use it when you need direct control
