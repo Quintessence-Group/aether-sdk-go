@@ -35,12 +35,58 @@ type DocumentRecord struct {
 	// Source is the optional origin label for the document (e.g. "slack",
 	// "upload", "crawler"). Nil when the document has no source.
 	Source *string `json:"source,omitempty"`
+	// Partition is the partition the document lives in. Nil when the document
+	// lives in the default partition — mirrors the EntityID/Source convention.
+	Partition *string `json:"partition,omitempty"`
 	// Metadata is the structured metadata attached to the document.
 	Metadata Metadata `json:"metadata,omitempty"`
 	// CreatedAt is the RFC 3339 timestamp when the document was first inserted.
 	CreatedAt *string `json:"created_at,omitempty"`
 	// UpdatedAt is the RFC 3339 timestamp when the document was last modified.
 	UpdatedAt *string `json:"updated_at,omitempty"`
+}
+
+// AuditProof is the cryptographic provenance attached to an AuditRecord. It
+// carries the signed lineage of a ledger event so a caller can independently
+// verify that the recorded action was committed by the claimed node.
+type AuditProof struct {
+	// ContentID is the content-addressed identifier (e.g. "blake3:...") of the
+	// document state at the time of the event. Nil when the event has no
+	// associated content (for example a tombstone), in which case the key is
+	// omitted from the response entirely.
+	ContentID *string `json:"content_id,omitempty"`
+	// Lamport is the logical (Lamport) clock value of the event, giving a total
+	// order over a node's committed operations.
+	Lamport uint64 `json:"lamport"`
+	// NodeID is the identifier (64-hex) of the node that committed the event.
+	NodeID string `json:"node_id"`
+	// PublicKey is the hex-encoded public key the signature was produced with.
+	PublicKey string `json:"public_key"`
+	// Signature is the hex-encoded cryptographic signature over the event.
+	Signature string `json:"signature"`
+	// Verified reports whether the server successfully verified Signature
+	// against PublicKey for this event.
+	Verified bool `json:"verified"`
+}
+
+// AuditRecord is a single entry in a document's provenance/lineage trail, as
+// returned by Client.Lineage. Each record describes one committed action on a
+// resource together with its signed AuditProof.
+type AuditRecord struct {
+	// At is the RFC 3339 timestamp when the action was recorded.
+	At string `json:"at"`
+	// Actor is the identity that performed the action (e.g. "node:<hex>").
+	Actor string `json:"actor"`
+	// Action is the action that was performed (e.g. "document.inserted").
+	Action string `json:"action"`
+	// Resource is the resource the action targeted (e.g. "document:<uuid>").
+	Resource string `json:"resource"`
+	// Outcome is the result of the action (e.g. "committed").
+	Outcome string `json:"outcome"`
+	// Source is the origin of the record (e.g. "ledger").
+	Source string `json:"source"`
+	// Proof is the cryptographic provenance for this record.
+	Proof AuditProof `json:"proof"`
 }
 
 // IngestResult is the outcome of ingesting a single file via IngestFiles or
@@ -97,6 +143,10 @@ type SearchResult struct {
 	// Source is the optional origin label of the matched document. Nil when the
 	// document has no source.
 	Source *string `json:"source,omitempty"`
+	// Partition is the partition the matched document lives in. Nil when the
+	// document lives in the default partition — mirrors the EntityID/Source
+	// convention.
+	Partition *string `json:"partition,omitempty"`
 	// Metadata is the structured metadata attached to the matched document.
 	Metadata Metadata `json:"metadata,omitempty"`
 	// CreatedAt is the RFC 3339 timestamp when the matched document was first
@@ -136,6 +186,10 @@ type RetrievalResult struct {
 	// Source is the optional origin label of the matched document. Nil when the
 	// document has no source.
 	Source *string `json:"source,omitempty"`
+	// Partition is the partition the matched document lives in. Nil when the
+	// document lives in the default partition — mirrors the EntityID/Source
+	// convention.
+	Partition *string `json:"partition,omitempty"`
 	// Metadata is the structured metadata attached to the matched document.
 	Metadata Metadata `json:"metadata,omitempty"`
 	// CreatedAt is the RFC 3339 timestamp when the matched document was first
@@ -467,6 +521,14 @@ type searchFeedbackRequest struct {
 type backfillEntityRequest struct {
 	TagPrefix string `json:"tag_prefix"`
 	Overwrite bool   `json:"overwrite"`
+}
+
+// moveDocumentRequest is the wire body of POST /documents/{id}/move. Both
+// fields are always present on the wire — an explicit null names the default
+// partition and an omitted field is a 400 — so neither carries omitempty.
+type moveDocumentRequest struct {
+	ToPartition     *string `json:"to_partition"`
+	ExpectPartition *string `json:"expect_partition"`
 }
 
 // ── Partition lifecycle ───────────────────────────────────────────

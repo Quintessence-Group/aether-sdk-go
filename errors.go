@@ -29,8 +29,10 @@ const (
 	// CodePartitionRequired is returned with HTTP 400 when a multi-tenant key
 	// makes a call without naming a partition. The key requires every
 	// read/write to be scoped; scope the call through Partition("<id>")
-	// instead of the top-level client. Not retryable — it is a programming
-	// error, not a transient failure.
+	// instead of the top-level client. Keys minted with strict scoping
+	// additionally get it on any doc_id-addressed call made without the
+	// partition guard. Not retryable — it is a programming error, not a
+	// transient failure.
 	CodePartitionRequired = "partition_required"
 )
 
