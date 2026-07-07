@@ -254,13 +254,16 @@ func (c *Client) Partition(partitionID string) (*Client, error) {
 // so every caller (including the Memory facade) versions its paths in one
 // place. The same choke point stamps the SDK User-Agent and, for logical
 // writes, the caller-minted Idempotency-Key (empty for reads).
-func (c *Client) newRequest(ctx context.Context, method, path, idempotencyKey string, body io.Reader) (*http.Request, error) {
+func (c *Client) newRequest(ctx context.Context, method, path, idempotencyKey, contentType string, body io.Reader) (*http.Request, error) {
 	reqURL := c.baseURL + versionedPath(path)
 	req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", userAgent)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
@@ -275,7 +278,21 @@ func isRetryableStatus(code int) bool {
 	return code == 429 || code == 502 || code == 503 || code == 504
 }
 
+// doJSON sends a request whose body (when present) is a JSON payload, labelled
+// `Content-Type: application/json` — the node's typed-body routes reject an
+// unlabelled body with 415. Raw content uploads go through doRaw instead: the
+// stored document's content_type comes from the `content_type` query param,
+// never the transport header, so those requests deliberately leave it unset.
 func (c *Client) doJSON(ctx context.Context, method, path string, body io.Reader, result any) error {
+	return c.doBody(ctx, method, path, "application/json", body, result)
+}
+
+// doRawBody sends a request whose body is raw document content (no Content-Type).
+func (c *Client) doRawBody(ctx context.Context, method, path string, body io.Reader, result any) error {
+	return c.doBody(ctx, method, path, "", body, result)
+}
+
+func (c *Client) doBody(ctx context.Context, method, path, contentType string, body io.Reader, result any) error {
 	if c.cfgErr != nil {
 		return c.cfgErr
 	}
@@ -298,10 +315,12 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body io.Reader
 
 	resp, err := c.doWithRetry(ctx, func() (*http.Request, error) {
 		var bodyReader io.Reader
+		ct := ""
 		if bodyBytes != nil {
 			bodyReader = bytes.NewReader(bodyBytes)
+			ct = contentType
 		}
-		return c.newRequest(ctx, method, path, idempotencyKey, bodyReader)
+		return c.newRequest(ctx, method, path, idempotencyKey, ct, bodyReader)
 	})
 	if err != nil {
 		return err
@@ -392,7 +411,8 @@ func (c *Client) doWithRetry(ctx context.Context, buildReq func() (*http.Request
 
 // doJSONNoRetry sends a single HTTP request without retries and decodes the
 // JSON response into result. Used for streaming uploads where the body is not
-// re-readable.
+// re-readable — the body is raw document content, so no Content-Type is set
+// (the content_type query param carries the document's type; see doRaw).
 func (c *Client) doJSONNoRetry(ctx context.Context, method, path string, body io.Reader, result any) error {
 	if c.cfgErr != nil {
 		return c.cfgErr
@@ -401,7 +421,7 @@ func (c *Client) doJSONNoRetry(ctx context.Context, method, path string, body io
 	if method == http.MethodPost {
 		idempotencyKey = newIdempotencyKey()
 	}
-	req, err := c.newRequest(ctx, method, path, idempotencyKey, body)
+	req, err := c.newRequest(ctx, method, path, idempotencyKey, "", body)
 	if err != nil {
 		return &NetworkError{Err: err}
 	}
@@ -439,7 +459,7 @@ func (c *Client) doRaw(ctx context.Context, path string) ([]byte, error) {
 		return nil, c.cfgErr
 	}
 	resp, err := c.doWithRetry(ctx, func() (*http.Request, error) {
-		return c.newRequest(ctx, http.MethodGet, path, "", nil)
+		return c.newRequest(ctx, http.MethodGet, path, "", "", nil)
 	})
 	if err != nil {
 		return nil, err
@@ -882,7 +902,7 @@ func (c *Client) Insert(ctx context.Context, data []byte, filename, contentType 
 	}
 	c.applyPartitionParam(params)
 	var doc DocumentRecord
-	err := c.doJSON(ctx, http.MethodPost, "/documents?"+params.Encode(), bytes.NewReader(data), &doc)
+	err := c.doRawBody(ctx, http.MethodPost, "/documents?"+params.Encode(), bytes.NewReader(data), &doc)
 	if err != nil {
 		return nil, err
 	}
@@ -968,7 +988,7 @@ func (c *Client) Update(ctx context.Context, docID string, data []byte, filename
 	}
 	c.applyPartitionParam(params)
 	var doc DocumentRecord
-	err := c.doJSON(ctx, http.MethodPut,
+	err := c.doRawBody(ctx, http.MethodPut,
 		"/documents/"+url.PathEscape(docID)+"?"+params.Encode(),
 		bytes.NewReader(data), &doc)
 	if err != nil {
@@ -1589,7 +1609,7 @@ func (c *Client) InsertAsync(ctx context.Context, data []byte, filename, content
 	}
 	c.applyPartitionParam(params)
 	var result AsyncJobResult
-	err := c.doJSON(ctx, http.MethodPost, "/documents/async?"+params.Encode(), bytes.NewReader(data), &result)
+	err := c.doRawBody(ctx, http.MethodPost, "/documents/async?"+params.Encode(), bytes.NewReader(data), &result)
 	if err != nil {
 		return nil, err
 	}
