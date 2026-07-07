@@ -131,3 +131,39 @@ func TestInsecureConfigFailsRequest(t *testing.T) {
 		t.Errorf("expected insecure-HTTP error from request, got %v", err)
 	}
 }
+
+// Typed-body endpoints reject an unlabelled JSON body with 415, so every
+// JSON-carrying request must be stamped `Content-Type: application/json` —
+// while raw document uploads must NOT be: the stored content_type comes from
+// the content_type query parameter, and mislabelling the transport would
+// invite future middleware to trust the wrong signal.
+func TestJSONBodyCarriesContentType(t *testing.T) {
+	var got string
+	_, client := jsonServer(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("Content-Type")
+		_ = json.NewEncoder(w).Encode(DocumentRecord{DocID: "d1"})
+	})
+	from, to := "part-a", "part-b"
+	if _, err := client.MoveDocument(context.Background(), "11111111-1111-4111-8111-111111111111", &from, &to); err != nil {
+		t.Fatalf("MoveDocument: %v", err)
+	}
+	if got != "application/json" {
+		t.Errorf("JSON body sent Content-Type %q, want application/json", got)
+	}
+}
+
+func TestRawUploadOmitsContentTypeHeader(t *testing.T) {
+	var got string
+	var present bool
+	_, client := jsonServer(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("Content-Type")
+		_, present = r.Header["Content-Type"]
+		_ = json.NewEncoder(w).Encode(DocumentRecord{DocID: "d1"})
+	})
+	if _, err := client.Insert(context.Background(), []byte("raw bytes"), "t.txt", "text/plain"); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if present {
+		t.Errorf("raw upload sent Content-Type header %q; the content_type query param is the only content-type signal", got)
+	}
+}
