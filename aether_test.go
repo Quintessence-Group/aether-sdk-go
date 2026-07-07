@@ -440,6 +440,118 @@ func TestGet(t *testing.T) {
 	}
 }
 
+// ── Lineage ───────────────────────────────────────────────────────
+
+func TestLineage(t *testing.T) {
+	var gotPath string
+	contentID := "blake3:abc123"
+	_, client := jsonServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		// Two records: an insert WITH content_id, and a tombstone that omits
+		// the content_id key entirely (must decode to a nil pointer).
+		_, _ = w.Write([]byte(`{
+			"doc_id": "abc-123",
+			"records": [
+				{
+					"at": "2026-07-05T12:00:00+00:00",
+					"actor": "node:deadbeef",
+					"action": "document.inserted",
+					"resource": "document:abc-123",
+					"outcome": "committed",
+					"source": "ledger",
+					"proof": {
+						"content_id": "blake3:abc123",
+						"lamport": 42,
+						"node_id": "0000000000000000000000000000000000000000000000000000000000000001",
+						"public_key": "aa11",
+						"signature": "bb22",
+						"verified": true
+					}
+				},
+				{
+					"at": "2026-07-05T12:05:00+00:00",
+					"actor": "node:deadbeef",
+					"action": "document.tombstoned",
+					"resource": "document:abc-123",
+					"outcome": "committed",
+					"source": "ledger",
+					"proof": {
+						"lamport": 43,
+						"node_id": "0000000000000000000000000000000000000000000000000000000000000001",
+						"public_key": "aa11",
+						"signature": "cc33",
+						"verified": true
+					}
+				}
+			]
+		}`))
+	})
+
+	records, err := client.Lineage(context.Background(), "abc-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v1/audit/records/abc-123" {
+		t.Errorf("expected path /v1/audit/records/abc-123, got %s", gotPath)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(records))
+	}
+
+	// Insert record: fields populated, content_id present.
+	ins := records[0]
+	if ins.Action != "document.inserted" {
+		t.Errorf("expected action document.inserted, got %s", ins.Action)
+	}
+	if ins.Actor != "node:deadbeef" {
+		t.Errorf("expected actor node:deadbeef, got %s", ins.Actor)
+	}
+	if ins.Outcome != "committed" {
+		t.Errorf("expected outcome committed, got %s", ins.Outcome)
+	}
+	if ins.Source != "ledger" {
+		t.Errorf("expected source ledger, got %s", ins.Source)
+	}
+	if ins.Proof.Lamport != 42 {
+		t.Errorf("expected lamport 42, got %d", ins.Proof.Lamport)
+	}
+	if !ins.Proof.Verified {
+		t.Error("expected verified true on insert proof")
+	}
+	if ins.Proof.ContentID == nil {
+		t.Fatal("expected non-nil content_id on insert proof")
+	}
+	if *ins.Proof.ContentID != contentID {
+		t.Errorf("expected content_id %q, got %q", contentID, *ins.Proof.ContentID)
+	}
+
+	// Tombstone record: content_id key omitted → nil pointer.
+	tomb := records[1]
+	if tomb.Action != "document.tombstoned" {
+		t.Errorf("expected action document.tombstoned, got %s", tomb.Action)
+	}
+	if tomb.Proof.Lamport != 43 {
+		t.Errorf("expected lamport 43, got %d", tomb.Proof.Lamport)
+	}
+	if tomb.Proof.ContentID != nil {
+		t.Errorf("expected nil content_id on tombstone proof, got %q", *tomb.Proof.ContentID)
+	}
+}
+
+func TestLineageNotFound(t *testing.T) {
+	_, client := jsonServer(t, errorHandler(404, "Document not found"))
+
+	_, err := client.Lineage(context.Background(), "nonexistent")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected APIError, got %T", err)
+	}
+	if apiErr.StatusCode != 404 {
+		t.Errorf("expected 404, got %d", apiErr.StatusCode)
+	}
+}
+
 // ── Download ──────────────────────────────────────────────────────
 
 func TestDownload(t *testing.T) {
@@ -2409,36 +2521,9 @@ func TestUnscopedClientOmitsPartition(t *testing.T) {
 	}
 }
 
-// TestDocIDAddressedMethodsSendNoPartition verifies that doc_id-addressed methods
-// send no partition even from a scoped handle.
-func TestDocIDAddressedMethodsSendNoPartition(t *testing.T) {
-	var gotURL string
-	_, client := jsonServer(t, func(w http.ResponseWriter, r *http.Request) {
-		gotURL = r.URL.String()
-		_ = json.NewEncoder(w).Encode(DocumentRecord{DocID: "doc-1"})
-	})
-	scoped, err := client.Partition("tenant-x")
-	if err != nil {
-		t.Fatalf("Partition: %v", err)
-	}
-	ctx := context.Background()
-
-	gotURL = ""
-	if _, err := scoped.Get(ctx, "doc-1"); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(gotURL, "partition") {
-		t.Errorf("get: expected no partition, got %s", gotURL)
-	}
-
-	gotURL = ""
-	if err := scoped.Delete(ctx, "doc-1"); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(gotURL, "partition") {
-		t.Errorf("delete: expected no partition, got %s", gotURL)
-	}
-}
+// Doc_id-addressed methods are partition-checked when scoped: the handle sends
+// the partition as a guard on every one of them. The per-route guard matrix
+// (scoped injects, unscoped omits) lives in partitions_test.go.
 
 // TestPartitionValidation verifies that empty/whitespace and >256-char partition
 // ids are rejected with an argument error and make no HTTP call.

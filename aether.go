@@ -22,7 +22,7 @@ import (
 )
 
 // Version is the SDK version, sent in the User-Agent header.
-const Version = "0.3.3"
+const Version = "0.4.0"
 
 // userAgent identifies the SDK + version + Go runtime so the server can
 // attribute traffic, track version adoption, and target deprecations.
@@ -222,6 +222,12 @@ func validatePartition(partitionID string) error {
 // to never forget it. The default (unscoped) client keeps operating on the
 // default partition, so single-tenant usage stays frictionless.
 //
+// Doc_id-addressed methods (Get, Download, DownloadText, Delete, HardDelete,
+// Restore, Update) are partition-checked when scoped: the handle sends the
+// partition as a guard, and a document in a different partition is a 404
+// identical to a nonexistent id — a scoped client can no longer reach another
+// partition's document via a bare doc id.
+//
 // The returned client shares the underlying transport and all configuration
 // (base url, api key, timeout, retries, backoff) with the receiver — it does not
 // own the transport, so the base client remains responsible for it. Scoping is
@@ -248,13 +254,16 @@ func (c *Client) Partition(partitionID string) (*Client, error) {
 // so every caller (including the Memory facade) versions its paths in one
 // place. The same choke point stamps the SDK User-Agent and, for logical
 // writes, the caller-minted Idempotency-Key (empty for reads).
-func (c *Client) newRequest(ctx context.Context, method, path, idempotencyKey string, body io.Reader) (*http.Request, error) {
+func (c *Client) newRequest(ctx context.Context, method, path, idempotencyKey, contentType string, body io.Reader) (*http.Request, error) {
 	reqURL := c.baseURL + versionedPath(path)
 	req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", userAgent)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
@@ -269,7 +278,21 @@ func isRetryableStatus(code int) bool {
 	return code == 429 || code == 502 || code == 503 || code == 504
 }
 
+// doJSON sends a request whose body (when present) is a JSON payload, labelled
+// `Content-Type: application/json` — the node's typed-body routes reject an
+// unlabelled body with 415. Raw content uploads go through doRaw instead: the
+// stored document's content_type comes from the `content_type` query param,
+// never the transport header, so those requests deliberately leave it unset.
 func (c *Client) doJSON(ctx context.Context, method, path string, body io.Reader, result any) error {
+	return c.doBody(ctx, method, path, "application/json", body, result)
+}
+
+// doRawBody sends a request whose body is raw document content (no Content-Type).
+func (c *Client) doRawBody(ctx context.Context, method, path string, body io.Reader, result any) error {
+	return c.doBody(ctx, method, path, "", body, result)
+}
+
+func (c *Client) doBody(ctx context.Context, method, path, contentType string, body io.Reader, result any) error {
 	if c.cfgErr != nil {
 		return c.cfgErr
 	}
@@ -292,10 +315,12 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body io.Reader
 
 	resp, err := c.doWithRetry(ctx, func() (*http.Request, error) {
 		var bodyReader io.Reader
+		ct := ""
 		if bodyBytes != nil {
 			bodyReader = bytes.NewReader(bodyBytes)
+			ct = contentType
 		}
-		return c.newRequest(ctx, method, path, idempotencyKey, bodyReader)
+		return c.newRequest(ctx, method, path, idempotencyKey, ct, bodyReader)
 	})
 	if err != nil {
 		return err
@@ -386,7 +411,8 @@ func (c *Client) doWithRetry(ctx context.Context, buildReq func() (*http.Request
 
 // doJSONNoRetry sends a single HTTP request without retries and decodes the
 // JSON response into result. Used for streaming uploads where the body is not
-// re-readable.
+// re-readable — the body is raw document content, so no Content-Type is set
+// (the content_type query param carries the document's type; see doRaw).
 func (c *Client) doJSONNoRetry(ctx context.Context, method, path string, body io.Reader, result any) error {
 	if c.cfgErr != nil {
 		return c.cfgErr
@@ -395,7 +421,7 @@ func (c *Client) doJSONNoRetry(ctx context.Context, method, path string, body io
 	if method == http.MethodPost {
 		idempotencyKey = newIdempotencyKey()
 	}
-	req, err := c.newRequest(ctx, method, path, idempotencyKey, body)
+	req, err := c.newRequest(ctx, method, path, idempotencyKey, "", body)
 	if err != nil {
 		return &NetworkError{Err: err}
 	}
@@ -433,7 +459,7 @@ func (c *Client) doRaw(ctx context.Context, path string) ([]byte, error) {
 		return nil, c.cfgErr
 	}
 	resp, err := c.doWithRetry(ctx, func() (*http.Request, error) {
-		return c.newRequest(ctx, http.MethodGet, path, "", nil)
+		return c.newRequest(ctx, http.MethodGet, path, "", "", nil)
 	})
 	if err != nil {
 		return nil, err
@@ -808,6 +834,25 @@ func (c *Client) applyPartitionParam(params url.Values) {
 	}
 }
 
+// appendPartitionParam appends the handle's partition as a query param to a
+// path that otherwise carries no partition-aware params — the doc_id-addressed
+// routes, where it acts as a guard: a scoped client can no longer reach another
+// partition's document via a bare doc id (a mismatch is the same 404 as a
+// nonexistent id). An unscoped client leaves the path untouched, so unscoped
+// requests are byte-identical to before.
+func (c *Client) appendPartitionParam(path string) string {
+	if c.partition == "" {
+		return path
+	}
+	params := url.Values{}
+	c.applyPartitionParam(params)
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + params.Encode()
+}
+
 // ── Documents ─────────────────────────────────────────────────────
 
 // GuessContentType returns a MIME type for the given filename based on its extension.
@@ -857,7 +902,7 @@ func (c *Client) Insert(ctx context.Context, data []byte, filename, contentType 
 	}
 	c.applyPartitionParam(params)
 	var doc DocumentRecord
-	err := c.doJSON(ctx, http.MethodPost, "/documents?"+params.Encode(), bytes.NewReader(data), &doc)
+	err := c.doRawBody(ctx, http.MethodPost, "/documents?"+params.Encode(), bytes.NewReader(data), &doc)
 	if err != nil {
 		return nil, err
 	}
@@ -943,7 +988,7 @@ func (c *Client) Update(ctx context.Context, docID string, data []byte, filename
 	}
 	c.applyPartitionParam(params)
 	var doc DocumentRecord
-	err := c.doJSON(ctx, http.MethodPut,
+	err := c.doRawBody(ctx, http.MethodPut,
 		"/documents/"+url.PathEscape(docID)+"?"+params.Encode(),
 		bytes.NewReader(data), &doc)
 	if err != nil {
@@ -952,25 +997,48 @@ func (c *Client) Update(ctx context.Context, docID string, data []byte, filename
 	return &doc, nil
 }
 
-// Get retrieves document metadata.
+// Get retrieves document metadata. Under a partition handle the partition is
+// sent as a guard: a document in a different partition is a 404, identical to
+// a nonexistent id.
 func (c *Client) Get(ctx context.Context, docID string) (*DocumentRecord, error) {
 	if docID == "" {
 		return nil, fmt.Errorf("aether: docID cannot be empty")
 	}
 	var doc DocumentRecord
-	err := c.doJSON(ctx, http.MethodGet, "/documents/"+url.PathEscape(docID), nil, &doc)
+	err := c.doJSON(ctx, http.MethodGet, c.appendPartitionParam("/documents/"+url.PathEscape(docID)), nil, &doc)
 	if err != nil {
 		return nil, err
 	}
 	return &doc, nil
 }
 
-// Download retrieves a document's raw bytes.
+// Lineage retrieves the signed provenance/lineage trail for a document: the
+// ordered list of committed actions (insert, update, tombstone, …) recorded in
+// the ledger, each with its cryptographic AuditProof. The endpoint is
+// tenant-scoped by the API key, so no partition guard is sent; a document that
+// does not exist for the calling tenant is a 404, identical to Get.
+func (c *Client) Lineage(ctx context.Context, docID string) ([]AuditRecord, error) {
+	if docID == "" {
+		return nil, fmt.Errorf("aether: docID cannot be empty")
+	}
+	var resp struct {
+		DocID   string        `json:"doc_id"`
+		Records []AuditRecord `json:"records"`
+	}
+	err := c.doJSON(ctx, http.MethodGet, "/audit/records/"+url.PathEscape(docID), nil, &resp)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Records, nil
+}
+
+// Download retrieves a document's raw bytes. Under a partition handle the
+// partition is sent as a guard, exactly as in Get.
 func (c *Client) Download(ctx context.Context, docID string) ([]byte, error) {
 	if docID == "" {
 		return nil, fmt.Errorf("aether: docID cannot be empty")
 	}
-	return c.doRaw(ctx, "/documents/"+url.PathEscape(docID)+"/download")
+	return c.doRaw(ctx, c.appendPartitionParam("/documents/"+url.PathEscape(docID)+"/download"))
 }
 
 // DownloadText retrieves a document's content as a string.
@@ -1089,31 +1157,34 @@ func (c *Client) List(ctx context.Context, opts *ListOptions) (*ListResult, erro
 }
 
 // Delete tombstones a document (soft delete): it is hidden from list/search and
-// can be brought back with Restore.
+// can be brought back with Restore. Under a partition handle the partition is
+// sent as a guard, exactly as in Get.
 func (c *Client) Delete(ctx context.Context, docID string) error {
 	if docID == "" {
 		return fmt.Errorf("aether: docID cannot be empty")
 	}
-	return c.doVoid(ctx, http.MethodDelete, "/documents/"+url.PathEscape(docID))
+	return c.doVoid(ctx, http.MethodDelete, c.appendPartitionParam("/documents/"+url.PathEscape(docID)))
 }
 
 // HardDelete permanently purges a document: it is removed from the primary
 // store and both the vector and keyword indexes, and its encryption key
 // is shredded. This is irreversible — nothing is recoverable afterwards (the
-// right-to-be-forgotten path). Use Delete for a recoverable tombstone.
+// right-to-be-forgotten path). Use Delete for a recoverable tombstone. Under a
+// partition handle the partition is sent as a guard, exactly as in Get.
 func (c *Client) HardDelete(ctx context.Context, docID string) error {
 	if docID == "" {
 		return fmt.Errorf("aether: docID cannot be empty")
 	}
-	return c.doVoid(ctx, http.MethodDelete, "/documents/"+url.PathEscape(docID)+"?hard=true")
+	return c.doVoid(ctx, http.MethodDelete, c.appendPartitionParam("/documents/"+url.PathEscape(docID)+"?hard=true"))
 }
 
-// Restore un-tombstones a document.
+// Restore un-tombstones a document. Under a partition handle the partition is
+// sent as a guard, exactly as in Get.
 func (c *Client) Restore(ctx context.Context, docID string) error {
 	if docID == "" {
 		return fmt.Errorf("aether: docID cannot be empty")
 	}
-	return c.doVoid(ctx, http.MethodPost, "/documents/"+url.PathEscape(docID)+"/restore")
+	return c.doVoid(ctx, http.MethodPost, c.appendPartitionParam("/documents/"+url.PathEscape(docID)+"/restore"))
 }
 
 // BackfillEntityFromTags backfills entity_id on the tenant's existing documents
@@ -1123,6 +1194,8 @@ func (c *Client) Restore(ctx context.Context, docID string) error {
 // Documents that already have an entity_id are left alone unless overwrite is
 // true. This is a metadata-only operation: documents are not re-embedded.
 // It returns an EntityBackfillReport summarizing how documents were classified.
+// Under a partition handle the scan is constrained to that partition; a
+// multi-tenant key must be scoped (400 partition_required otherwise).
 func (c *Client) BackfillEntityFromTags(ctx context.Context, tagPrefix string, overwrite bool) (*EntityBackfillReport, error) {
 	if tagPrefix == "" {
 		return nil, fmt.Errorf("aether: tagPrefix cannot be empty")
@@ -1135,10 +1208,51 @@ func (c *Client) BackfillEntityFromTags(ctx context.Context, tagPrefix string, o
 		return nil, fmt.Errorf("aether: failed to encode request: %w", err)
 	}
 	var report EntityBackfillReport
-	if err := c.doJSON(ctx, http.MethodPost, "/documents/backfill-entity", bytes.NewReader(payload), &report); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.appendPartitionParam("/documents/backfill-entity"), bytes.NewReader(payload), &report); err != nil {
 		return nil, err
 	}
 	return &report, nil
+}
+
+// MoveDocument re-homes a document into another partition — the explicit,
+// metadata-only partition move and the only way to move a document between
+// named partitions. from asserts the partition the document lives in NOW and
+// to is the destination; nil names the default partition for either. Content,
+// CID, chunks, and vectors are unchanged (no re-embed); Version increments on
+// a real move. A wrong from assertion, a missing id, or a tombstoned id is the
+// same 404 as a nonexistent document (the call is never a partition-existence
+// oracle); from == to is an idempotent 200 no-op. Returns the updated record.
+//
+// A move operates on the partition boundary itself, so it names both
+// partitions explicitly and is never scoped by a partition handle.
+func (c *Client) MoveDocument(ctx context.Context, docID string, from, to *string) (*DocumentRecord, error) {
+	if docID == "" {
+		return nil, fmt.Errorf("aether: docID cannot be empty")
+	}
+	// Non-nil partition ids are validated like the handle id; nil is exempt
+	// because it is a meaningful value (the default partition), not an omission.
+	if from != nil {
+		if err := validatePartition(*from); err != nil {
+			return nil, err
+		}
+	}
+	if to != nil {
+		if err := validatePartition(*to); err != nil {
+			return nil, err
+		}
+	}
+	payload, err := json.Marshal(moveDocumentRequest{
+		ToPartition:     to,
+		ExpectPartition: from,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("aether: failed to encode request: %w", err)
+	}
+	var doc DocumentRecord
+	if err := c.doJSON(ctx, http.MethodPost, "/documents/"+url.PathEscape(docID)+"/move", bytes.NewReader(payload), &doc); err != nil {
+		return nil, err
+	}
+	return &doc, nil
 }
 
 // ── Search ────────────────────────────────────────────────────────
@@ -1273,6 +1387,7 @@ func (c *Client) Retrieve(ctx context.Context, query string, k int, opts ...Sear
 			Passage:     r.Passage,
 			Tags:        r.Tags,
 			Source:      r.Source,
+			Partition:   r.Partition,
 			Metadata:    r.Metadata,
 			CreatedAt:   r.CreatedAt,
 			UpdatedAt:   r.UpdatedAt,
@@ -1494,7 +1609,7 @@ func (c *Client) InsertAsync(ctx context.Context, data []byte, filename, content
 	}
 	c.applyPartitionParam(params)
 	var result AsyncJobResult
-	err := c.doJSON(ctx, http.MethodPost, "/documents/async?"+params.Encode(), bytes.NewReader(data), &result)
+	err := c.doRawBody(ctx, http.MethodPost, "/documents/async?"+params.Encode(), bytes.NewReader(data), &result)
 	if err != nil {
 		return nil, err
 	}
