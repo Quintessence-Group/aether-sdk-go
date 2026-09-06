@@ -19,10 +19,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Version is the SDK version, sent in the User-Agent header.
-const Version = "0.4.0"
+const Version = "0.6.0"
 
 // userAgent identifies the SDK + version + Go runtime so the server can
 // attribute traffic, track version adoption, and target deprecations.
@@ -287,12 +289,23 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body io.Reader
 	return c.doBody(ctx, method, path, "application/json", body, result)
 }
 
+// doJSONWithIdempotency is the thread-append variant of doJSON. The caller's
+// stable key is retained across every retry, including retries initiated after
+// a lost response. An empty key preserves the SDK's normal generated-key path.
+func (c *Client) doJSONWithIdempotency(ctx context.Context, method, path string, body io.Reader, result any, idempotencyKey string) error {
+	return c.doBodyWithIdempotency(ctx, method, path, "application/json", body, result, idempotencyKey)
+}
+
 // doRawBody sends a request whose body is raw document content (no Content-Type).
 func (c *Client) doRawBody(ctx context.Context, method, path string, body io.Reader, result any) error {
 	return c.doBody(ctx, method, path, "", body, result)
 }
 
 func (c *Client) doBody(ctx context.Context, method, path, contentType string, body io.Reader, result any) error {
+	return c.doBodyWithIdempotency(ctx, method, path, contentType, body, result, "")
+}
+
+func (c *Client) doBodyWithIdempotency(ctx context.Context, method, path, contentType string, body io.Reader, result any, idempotencyKey string) error {
 	if c.cfgErr != nil {
 		return c.cfgErr
 	}
@@ -308,8 +321,7 @@ func (c *Client) doBody(ctx context.Context, method, path, contentType string, b
 
 	// Mint one idempotency key per logical write, reused across retries so the
 	// server can deduplicate a request whose response was lost in transit.
-	idempotencyKey := ""
-	if method == http.MethodPost {
+	if method == http.MethodPost && idempotencyKey == "" {
 		idempotencyKey = newIdempotencyKey()
 	}
 
@@ -352,11 +364,16 @@ func (c *Client) doBody(ctx context.Context, method, path, contentType string, b
 func (c *Client) sleepBackoff(ctx context.Context, attempt int, resp *http.Response) {
 	delay := time.Duration(float64(c.retryBackoff) * math.Pow(2, float64(attempt)))
 
-	// For 429 responses, respect the Retry-After header if present.
-	if resp != nil && resp.StatusCode == 429 {
+	// Respect Retry-After on every retryable HTTP response. In particular, a
+	// thread origin returns 503 while a committed turn is awaiting its local
+	// projection, and Thread.Context downloads must use the bounded server hint.
+	if resp != nil && isRetryableStatus(resp.StatusCode) {
 		if ra := resp.Header.Get("Retry-After"); ra != "" {
-			if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
-				delay = time.Duration(secs) * time.Second
+			if secs, err := strconv.Atoi(ra); err == nil && secs >= 0 {
+				retryAfter := time.Duration(secs) * time.Second
+				if retryAfter > delay {
+					delay = retryAfter
+				}
 			}
 		}
 	}
@@ -414,6 +431,16 @@ func (c *Client) doWithRetry(ctx context.Context, buildReq func() (*http.Request
 // re-readable — the body is raw document content, so no Content-Type is set
 // (the content_type query param carries the document's type; see doRaw).
 func (c *Client) doJSONNoRetry(ctx context.Context, method, path string, body io.Reader, result any) error {
+	return c.doBodyNoRetry(ctx, method, path, "", body, result)
+}
+
+// doJSONContentNoRetry sends one JSON request without retries. It is used for
+// share issuance: an ambiguous retry could create a second bearer capability.
+func (c *Client) doJSONContentNoRetry(ctx context.Context, method, path string, body io.Reader, result any) error {
+	return c.doBodyNoRetry(ctx, method, path, "application/json", body, result)
+}
+
+func (c *Client) doBodyNoRetry(ctx context.Context, method, path, contentType string, body io.Reader, result any) error {
 	if c.cfgErr != nil {
 		return c.cfgErr
 	}
@@ -421,7 +448,7 @@ func (c *Client) doJSONNoRetry(ctx context.Context, method, path string, body io
 	if method == http.MethodPost {
 		idempotencyKey = newIdempotencyKey()
 	}
-	req, err := c.newRequest(ctx, method, path, idempotencyKey, "", body)
+	req, err := c.newRequest(ctx, method, path, idempotencyKey, contentType, body)
 	if err != nil {
 		return &NetworkError{Err: err}
 	}
@@ -603,6 +630,7 @@ type searchConfig struct {
 	sources        []string
 	filter         MetadataFilter
 	entityID       string
+	threadID       string
 	since          string
 	until          string
 	lastNDays      int
@@ -658,6 +686,13 @@ func WithMetadataFilter(filter MetadataFilter) SearchOption {
 // given entity id (set at insert time via WithEntityID).
 func WithSearchEntityID(id string) SearchOption {
 	return func(c *searchConfig) { c.entityID = id }
+}
+
+// WithSearchThreadID filters results to one conversation. Use
+// GetThread for canonical chronological context; this option composes a
+// conversation filter with semantic retrieval.
+func WithSearchThreadID(id string) SearchOption {
+	return func(c *searchConfig) { c.threadID = id }
 }
 
 // WithSince filters search results to documents created at or after the given
@@ -796,6 +831,12 @@ func applySearchParams(params url.Values, cfg searchConfig) error {
 	}
 	if cfg.entityID != "" {
 		params.Set("entity_id", cfg.entityID)
+	}
+	if cfg.threadID != "" {
+		if err := validateThreadID(cfg.threadID); err != nil {
+			return err
+		}
+		params.Set("thread_id", cfg.threadID)
 	}
 	if cfg.since != "" {
 		params.Set("since", cfg.since)
@@ -1012,6 +1053,219 @@ func (c *Client) Get(ctx context.Context, docID string) (*DocumentRecord, error)
 	return &doc, nil
 }
 
+// ThreadReadOption configures Client.GetThread.
+type ThreadReadOption func(*threadReadConfig)
+
+type threadReadConfig struct {
+	lastNTurns        int
+	recentFirst       bool
+	invalidLastNTurns bool
+}
+
+// WithLastNThreadTurns limits a GetThread response to the newest n turns.
+// n must be from 1 through 1000. Invalid values make GetThread return a
+// client-side error rather than silently widening the requested context.
+func WithLastNThreadTurns(n int) ThreadReadOption {
+	return func(c *threadReadConfig) {
+		if n < 1 || n > 1000 {
+			c.invalidLastNTurns = true
+			return
+		}
+		c.lastNTurns = n
+	}
+}
+
+// WithRecentThreadTurns returns the selected turns newest-first instead of
+// the default chronological order.
+func WithRecentThreadTurns() ThreadReadOption {
+	return func(c *threadReadConfig) { c.recentFirst = true }
+}
+
+func validateThreadID(threadID string) error {
+	if !utf8.ValidString(threadID) {
+		return fmt.Errorf("aether: threadID must contain valid UTF-8")
+	}
+	if strings.TrimSpace(threadID) == "" {
+		return fmt.Errorf("aether: threadID cannot be empty")
+	}
+	if threadID == "." || threadID == ".." {
+		return fmt.Errorf("aether: threadID cannot be a reserved URL dot segment")
+	}
+	if strings.IndexFunc(threadID, unicode.IsControl) >= 0 {
+		return fmt.Errorf("aether: threadID cannot contain control characters")
+	}
+	if utf8.RuneCountInString(threadID) > 256 {
+		return fmt.Errorf("aether: threadID must be at most 256 characters")
+	}
+	return nil
+}
+
+// AppendThread appends one logical turn to a tenant-scoped conversation. The
+// shared control plane assigns TurnIndex atomically; callers must never choose
+// it. When input.IdempotencyKey is empty the SDK mints one stable key for all
+// retries of this invocation.
+func (c *Client) AppendThread(ctx context.Context, threadID string, input ThreadAppendInput) (*DocumentRecord, error) {
+	if err := validateThreadID(threadID); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(input.Text) == "" {
+		return nil, fmt.Errorf("aether: thread text cannot be empty")
+	}
+	payload, err := json.Marshal(input)
+	if err != nil {
+		return nil, fmt.Errorf("aether: failed to encode thread append: %w", err)
+	}
+	path := c.appendPartitionParam("/threads/" + url.PathEscape(threadID) + "/append")
+	var record DocumentRecord
+	if err := c.doJSONWithIdempotency(
+		ctx, http.MethodPost, path, bytes.NewReader(payload), &record, input.IdempotencyKey,
+	); err != nil {
+		return nil, err
+	}
+	return &record, nil
+}
+
+// GetThread reads the canonical shared conversation. A partition-scoped client
+// automatically sends the same hard partition boundary it uses for documents
+// and search.
+func (c *Client) GetThread(ctx context.Context, threadID string, opts ...ThreadReadOption) (*ConversationThread, error) {
+	if err := validateThreadID(threadID); err != nil {
+		return nil, err
+	}
+	var cfg threadReadConfig
+	for _, option := range opts {
+		option(&cfg)
+	}
+	if cfg.invalidLastNTurns {
+		return nil, fmt.Errorf("aether: last_n_turns must be between 1 and 1000")
+	}
+	params := url.Values{}
+	if cfg.lastNTurns > 0 {
+		params.Set("last_n_turns", strconv.Itoa(cfg.lastNTurns))
+	}
+	if cfg.recentFirst {
+		params.Set("recent_first", "true")
+	}
+	c.applyPartitionParam(params)
+	path := "/threads/" + url.PathEscape(threadID)
+	if encoded := params.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var thread ConversationThread
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &thread); err != nil {
+		return nil, err
+	}
+	return &thread, nil
+}
+
+// ── Thread lifecycle ──────────────────────────────────────────────
+//
+// These owner/admin-scoped routes each require an Idempotency-Key header,
+// minted once per call and reused across the call's transport retries — exactly
+// as AppendThread does — so a request whose response was lost is deduplicated
+// rather than re-applied. Every route except ThreadMove sends the handle's
+// partition as a guard (the same boundary GetThread uses); ThreadMove names both
+// partitions in its body and is never scoped by a partition handle.
+
+// ThreadRestore un-tombstones a soft-deleted conversation, making its turns
+// visible to GetThread, search, and list again. It is the thread-level analog
+// of Restore. Under a partition handle the partition is sent as a guard,
+// exactly as in GetThread.
+func (c *Client) ThreadRestore(ctx context.Context, threadID string) (*ThreadLifecycleResult, error) {
+	if err := validateThreadID(threadID); err != nil {
+		return nil, err
+	}
+	// POST mints one idempotency key per call (reused across retries) exactly as
+	// doVoid did; doJSON additionally decodes the {status, thread_id, turns} body.
+	var result ThreadLifecycleResult
+	if err := c.doJSON(ctx, http.MethodPost, c.appendPartitionParam("/threads/"+url.PathEscape(threadID)+"/restore"), nil, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ThreadSetACL sets the read-ACL applied to this conversation. readers
+// distinguishes three cases the same way ThreadAppendInput.ACLReaders does: a
+// nil pointer unlabels the thread (tenant-visible), a non-nil pointer to an
+// empty slice quarantines it to admins only, and a non-nil pointer to a
+// non-empty slice restricts reads to exactly those principals. The field is
+// always present on the wire so the server can tell "unlabel" (null) from
+// "quarantine" ([]). Under a partition handle the partition is sent as a guard,
+// exactly as in GetThread.
+func (c *Client) ThreadSetACL(ctx context.Context, threadID string, readers *[]string) (*ThreadLifecycleResult, error) {
+	if err := validateThreadID(threadID); err != nil {
+		return nil, err
+	}
+	payload, err := json.Marshal(threadACLRequest{ACLReaders: readers})
+	if err != nil {
+		return nil, fmt.Errorf("aether: failed to encode thread ACL: %w", err)
+	}
+	path := c.appendPartitionParam("/threads/" + url.PathEscape(threadID) + "/acl")
+	var result ThreadLifecycleResult
+	if err := c.doBodyWithIdempotency(
+		ctx, http.MethodPut, path, "application/json", bytes.NewReader(payload), &result, newIdempotencyKey(),
+	); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ThreadMove re-homes a conversation into another partition. expectPartition
+// asserts the partition the thread lives in NOW and toPartition is the
+// destination; nil names the default partition for either. Like MoveDocument, a
+// move operates on the partition boundary itself, so it names both partitions
+// explicitly in the body and is never scoped by a partition handle.
+func (c *Client) ThreadMove(ctx context.Context, threadID string, expectPartition, toPartition *string) (*ThreadLifecycleResult, error) {
+	if err := validateThreadID(threadID); err != nil {
+		return nil, err
+	}
+	// Non-nil partition ids are validated like the handle id; nil is exempt
+	// because it is a meaningful value (the default partition), not an omission.
+	if expectPartition != nil {
+		if err := validatePartition(*expectPartition); err != nil {
+			return nil, err
+		}
+	}
+	if toPartition != nil {
+		if err := validatePartition(*toPartition); err != nil {
+			return nil, err
+		}
+	}
+	payload, err := json.Marshal(threadMoveRequest{
+		ToPartition:     toPartition,
+		ExpectPartition: expectPartition,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("aether: failed to encode thread move: %w", err)
+	}
+	var result ThreadLifecycleResult
+	if err := c.doJSON(ctx, http.MethodPost, "/threads/"+url.PathEscape(threadID)+"/move", bytes.NewReader(payload), &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ThreadDelete tombstones a conversation. By default this is a recoverable soft
+// tombstone (restorable via ThreadRestore); hard=true issues the irreversible
+// crypto hard delete (?hard=true), the right-to-be-forgotten path from which
+// nothing is recoverable. Under a partition handle the partition is sent as a
+// guard, exactly as in GetThread.
+func (c *Client) ThreadDelete(ctx context.Context, threadID string, hard bool) (*ThreadLifecycleResult, error) {
+	if err := validateThreadID(threadID); err != nil {
+		return nil, err
+	}
+	path := "/threads/" + url.PathEscape(threadID)
+	if hard {
+		path += "?hard=true"
+	}
+	path = c.appendPartitionParam(path)
+	var result ThreadLifecycleResult
+	if err := c.doBodyWithIdempotency(ctx, http.MethodDelete, path, "", nil, &result, newIdempotencyKey()); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // Lineage retrieves the signed provenance/lineage trail for a document: the
 // ordered list of committed actions (insert, update, tombstone, …) recorded in
 // the ledger, each with its cryptographic AuditProof. The endpoint is
@@ -1030,6 +1284,58 @@ func (c *Client) Lineage(ctx context.Context, docID string) ([]AuditRecord, erro
 		return nil, err
 	}
 	return resp.Records, nil
+}
+
+// CreateGroundingReceipt binds an answer to the ordered document IDs the
+// application declared as grounding sources. The returned trust signal verifies
+// retained signed source evidence, not factual correctness or how an external
+// model reasoned. Set share true to opt into a separate, revocable public-safe
+// aggregate receipt and SVG badge.
+func (c *Client) CreateGroundingReceipt(
+	ctx context.Context,
+	answer string,
+	sourceDocIDs []string,
+	share bool,
+) (*GroundingReceipt, error) {
+	if strings.TrimSpace(answer) == "" {
+		return nil, fmt.Errorf("aether: answer cannot be empty")
+	}
+	if len(sourceDocIDs) == 0 {
+		return nil, fmt.Errorf("aether: sourceDocIDs cannot be empty")
+	}
+	payload, err := json.Marshal(struct {
+		Answer       string   `json:"answer"`
+		SourceDocIDs []string `json:"source_doc_ids"`
+		Partition    string   `json:"partition,omitempty"`
+		Share        bool     `json:"share,omitempty"`
+	}{
+		Answer:       answer,
+		SourceDocIDs: sourceDocIDs,
+		Partition:    c.partition,
+		Share:        share,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("aether: encode grounding receipt request: %w", err)
+	}
+	var receipt GroundingReceipt
+	if share {
+		if err := c.doJSONContentNoRetry(ctx, http.MethodPost, "/audit/grounding", bytes.NewReader(payload), &receipt); err != nil {
+			return nil, err
+		}
+	} else if err := c.doJSON(ctx, http.MethodPost, "/audit/grounding", bytes.NewReader(payload), &receipt); err != nil {
+		return nil, err
+	}
+	return &receipt, nil
+}
+
+// RevokeGroundingReceipt revokes a public receipt owned by this tenant. Both
+// its public share URL and SVG badge return 404 after success; unknown/foreign
+// receipt IDs deliberately return the same 404.
+func (c *Client) RevokeGroundingReceipt(ctx context.Context, receiptID string) error {
+	if receiptID == "" {
+		return fmt.Errorf("aether: receiptID cannot be empty")
+	}
+	return c.doVoid(ctx, http.MethodDelete, c.appendPartitionParam("/audit/receipts/"+url.PathEscape(receiptID)))
 }
 
 // Download retrieves a document's raw bytes. Under a partition handle the
@@ -1336,10 +1642,12 @@ func (c *Client) SendSearchFeedback(ctx context.Context, queryID, docID, signal 
 	return c.doJSON(ctx, http.MethodPost, "/search/feedback", bytes.NewReader(payload), nil)
 }
 
-// Retrieve performs a search and returns results enriched with document content.
-// Results are deduplicated by DocID (highest-scoring match wins). Content is
-// returned inline when the server supports it; otherwise it falls back to
-// downloading each unique document's text by ID.
+// Retrieve performs a search and returns results enriched with retrieval-safe
+// text. Results are deduplicated by DocID (highest-scoring match wins). Content
+// is returned inline when the server supports it; text results otherwise fall
+// back to downloading the document. Media downloads are original binary assets,
+// so media results use their indexed caption/transcript passage (or a metadata
+// Get fallback) instead of decoding binary bytes as text.
 func (c *Client) Retrieve(ctx context.Context, query string, k int, opts ...SearchOption) ([]RetrievalResult, error) {
 	if query == "" {
 		return nil, fmt.Errorf("aether: query cannot be empty")
@@ -1370,6 +1678,19 @@ func (c *Client) Retrieve(ctx context.Context, query string, k int, opts ...Sear
 		var content string
 		if r.Content != nil {
 			content = *r.Content
+		} else if r.Modality != nil {
+			if r.Passage != nil {
+				content = *r.Passage
+			} else {
+				doc, err := c.Get(ctx, r.DocID)
+				if err != nil {
+					return nil, fmt.Errorf("aether: failed to load media metadata for doc %s: %w", r.DocID, err)
+				}
+				if doc.DerivedText == nil {
+					return nil, fmt.Errorf("aether: media result %s has no derived_text", r.DocID)
+				}
+				content = *doc.DerivedText
+			}
 		} else {
 			downloaded, err := c.DownloadText(ctx, r.DocID)
 			if err != nil {
@@ -1385,12 +1706,15 @@ func (c *Client) Retrieve(ctx context.Context, query string, k int, opts ...Sear
 			EntityID:    r.EntityID,
 			ContentType: r.ContentType,
 			Passage:     r.Passage,
+			ThreadID:    r.ThreadID,
+			TurnIndex:   r.TurnIndex,
 			Tags:        r.Tags,
 			Source:      r.Source,
 			Partition:   r.Partition,
 			Metadata:    r.Metadata,
 			CreatedAt:   r.CreatedAt,
 			UpdatedAt:   r.UpdatedAt,
+			Modality:    r.Modality,
 		})
 	}
 	return out, nil
@@ -1503,6 +1827,202 @@ func (c *Client) DeletePartition(ctx context.Context, partitionID string) (int, 
 		return 0, err
 	}
 	return resp.DocumentsDeleted, nil
+}
+
+// ── Connections + connect sessions ────
+
+// CreateConnectSessionOptions configures Client.CreateConnectSession.
+type CreateConnectSessionOptions struct {
+	// Provider defaults to "dropbox", the only provider today.
+	Provider string
+	// ExternalUserID is the developer's own id for the end user about to
+	// connect — by the pinned mapping it is also the partition id that will
+	// retrieve their synced content once connected.
+	ExternalUserID string
+	// ReturnURL must be https:// (or http://localhost / http://127.0.0.1
+	// for local development) with no fragment.
+	ReturnURL string
+	// TargetPartition overrides the partition this connection will sync
+	// into. Empty uses the pinned mapping (ExternalUserID names the
+	// partition).
+	TargetPartition string
+}
+
+// CreateConnectSession mints a connect session — the entry point for
+// connecting one of the developer's end users' sources (mode B). Open the
+// returned ConnectURL in the end user's browser to start the hosted OAuth
+// flow.
+//
+// On a partition handle, the handle's partition must equal the placement
+// this session will resolve to (opts.ExternalUserID, or
+// opts.TargetPartition if given) — a scoped handle for end user X can mint
+// a session only for X.
+//
+// ClientSecret is returned exactly once. Store it server-side; use it with
+// VerifyConnectRedirectSignature when the end user lands back on ReturnURL.
+func (c *Client) CreateConnectSession(ctx context.Context, opts CreateConnectSessionOptions) (*ConnectSession, error) {
+	if opts.ExternalUserID == "" {
+		return nil, fmt.Errorf("aether: ExternalUserID cannot be empty")
+	}
+	if opts.ReturnURL == "" {
+		return nil, fmt.Errorf("aether: ReturnURL cannot be empty")
+	}
+	provider := opts.Provider
+	if provider == "" {
+		provider = "dropbox"
+	}
+	payload, err := json.Marshal(struct {
+		Provider        string `json:"provider,omitempty"`
+		ExternalUserID  string `json:"external_user_id"`
+		ReturnURL       string `json:"return_url"`
+		TargetPartition string `json:"target_partition,omitempty"`
+	}{
+		Provider:        provider,
+		ExternalUserID:  opts.ExternalUserID,
+		ReturnURL:       opts.ReturnURL,
+		TargetPartition: opts.TargetPartition,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("aether: encode create connect session request: %w", err)
+	}
+	var session ConnectSession
+	path := c.appendPartitionParam("/connections/sessions")
+	if err := c.doJSON(ctx, http.MethodPost, path, bytes.NewReader(payload), &session); err != nil {
+		return nil, err
+	}
+	return &session, nil
+}
+
+// ListConnections lists connections in scope: the whole tenant when
+// unscoped, or one partition's under a handle.
+func (c *Client) ListConnections(ctx context.Context, opts ListConnectionsOptions) ([]Connection, error) {
+	params := url.Values{}
+	c.applyPartitionParam(params)
+	if opts.OwnerType != "" {
+		params.Set("owner_type", opts.OwnerType)
+	}
+	if opts.OwnerID != "" {
+		params.Set("owner_id", opts.OwnerID)
+	}
+	if opts.IncludePurgedSet && !opts.IncludePurged {
+		params.Set("include_purged", "false")
+	}
+	path := "/connections"
+	if encoded := params.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var resp connectionListResponse
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Connections, nil
+}
+
+// GetConnection fetches one connection. On a handle, a connection in a
+// different partition returns the same 404 as an unknown id.
+func (c *Client) GetConnection(ctx context.Context, connectionID string) (*Connection, error) {
+	if connectionID == "" {
+		return nil, fmt.Errorf("aether: connectionID cannot be empty")
+	}
+	var conn Connection
+	path := c.appendPartitionParam("/connections/" + url.PathEscape(connectionID))
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &conn); err != nil {
+		return nil, err
+	}
+	return &conn, nil
+}
+
+// DeleteConnection disconnects: revokes upstream, destroys the stored
+// credential, hard-deletes every document this connection synced, and
+// issues a signed purge receipt. Idempotent — disconnecting an
+// already-purged connection re-reports the same result. Fetch the full
+// receipt with GetPurgeReceipt.
+func (c *Client) DeleteConnection(ctx context.Context, connectionID string) (*DisconnectResult, error) {
+	if connectionID == "" {
+		return nil, fmt.Errorf("aether: connectionID cannot be empty")
+	}
+	var result DisconnectResult
+	path := c.appendPartitionParam("/connections/" + url.PathEscape(connectionID))
+	if err := c.doJSON(ctx, http.MethodDelete, path, nil, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ResyncConnection re-drives sync for one connection. Honest, narrow
+// semantics: this clears the connection's backoff and (if it was
+// paused/errored) flips it back to active — it does NOT run a sync inline.
+// The connection becomes eligible on the sync loop's next scheduled pass.
+func (c *Client) ResyncConnection(ctx context.Context, connectionID string) (*Connection, error) {
+	if connectionID == "" {
+		return nil, fmt.Errorf("aether: connectionID cannot be empty")
+	}
+	var resp resyncResponse
+	path := c.appendPartitionParam("/connections/" + url.PathEscape(connectionID) + "/resync")
+	if err := c.doJSON(ctx, http.MethodPost, path, nil, &resp); err != nil {
+		return nil, err
+	}
+	// The resync response is slim; fetch the full record so callers get one
+	// consistent shape everywhere.
+	return c.GetConnection(ctx, connectionID)
+}
+
+// BrowseConnection returns one page of a connection's source folder
+// listing, for a folder-picker UI. An empty cursor browses path fresh; pass
+// back NextCursor to continue.
+func (c *Client) BrowseConnection(ctx context.Context, connectionID, path string, cursor *string) (*ConnectionBrowsePage, error) {
+	if connectionID == "" {
+		return nil, fmt.Errorf("aether: connectionID cannot be empty")
+	}
+	payload, err := json.Marshal(struct {
+		Path   string  `json:"path"`
+		Cursor *string `json:"cursor"`
+	}{Path: path, Cursor: cursor})
+	if err != nil {
+		return nil, fmt.Errorf("aether: encode browse connection request: %w", err)
+	}
+	var page ConnectionBrowsePage
+	reqPath := c.appendPartitionParam("/connections/" + url.PathEscape(connectionID) + "/browse")
+	if err := c.doJSON(ctx, http.MethodPost, reqPath, bytes.NewReader(payload), &page); err != nil {
+		return nil, err
+	}
+	return &page, nil
+}
+
+// UpdateSelection replaces a connection's synced-path scope outright (not a
+// merge — send the full intended set; an empty slice means the whole
+// account). Returns the normalized list actually stored.
+func (c *Client) UpdateSelection(ctx context.Context, connectionID string, selectedPaths []string) ([]string, error) {
+	if connectionID == "" {
+		return nil, fmt.Errorf("aether: connectionID cannot be empty")
+	}
+	payload, err := json.Marshal(struct {
+		SelectedPaths []string `json:"selected_paths"`
+	}{SelectedPaths: selectedPaths})
+	if err != nil {
+		return nil, fmt.Errorf("aether: encode update selection request: %w", err)
+	}
+	var resp selectionResponse
+	path := c.appendPartitionParam("/connections/" + url.PathEscape(connectionID) + "/selection")
+	if err := c.doJSON(ctx, http.MethodPut, path, bytes.NewReader(payload), &resp); err != nil {
+		return nil, err
+	}
+	return resp.SelectedPaths, nil
+}
+
+// GetPurgeReceipt fetches a connection's disconnect-purge receipt — the
+// full signed proof, including every purged document id, the Merkle root,
+// the Ed25519 signature, and the node's own Verified re-check.
+func (c *Client) GetPurgeReceipt(ctx context.Context, receiptID string) (*ConnectionPurgeReceipt, error) {
+	if receiptID == "" {
+		return nil, fmt.Errorf("aether: receiptID cannot be empty")
+	}
+	var receipt ConnectionPurgeReceipt
+	path := c.appendPartitionParam("/connections/purge-receipts/" + url.PathEscape(receiptID))
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &receipt); err != nil {
+		return nil, err
+	}
+	return &receipt, nil
 }
 
 // InsertWithEmbeddings uploads a document with precomputed embeddings (BYOE).
@@ -1700,6 +2220,11 @@ func (c *Client) BatchSearch(ctx context.Context, queries []BatchSearchQuery) ([
 	}
 	wire := make([]batchSearchQueryWire, len(queries))
 	for i, q := range queries {
+		if q.ThreadID != "" {
+			if err := validateThreadID(q.ThreadID); err != nil {
+				return nil, err
+			}
+		}
 		wire[i] = batchSearchQueryWire{
 			Q:              q.Q,
 			K:              q.K,
@@ -1710,6 +2235,7 @@ func (c *Client) BatchSearch(ctx context.Context, queries []BatchSearchQuery) ([
 			Filter:         q.Filter,
 			IncludeContent: q.IncludeContent,
 			EntityID:       q.EntityID,
+			ThreadID:       q.ThreadID,
 			Since:          q.Since,
 			Until:          q.Until,
 			LastNDays:      q.LastNDays,
