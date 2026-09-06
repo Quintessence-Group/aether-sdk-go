@@ -24,7 +24,7 @@ import (
 )
 
 // Version is the SDK version, sent in the User-Agent header.
-const Version = "0.3.3"
+const Version = "0.6.0"
 
 // userAgent identifies the SDK + version + Go runtime so the server can
 // attribute traffic, track version adoption, and target deprecations.
