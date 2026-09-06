@@ -1,9 +1,16 @@
 package aether
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,8 +22,9 @@ import (
 // once with an entity id (a user, a customer, a patient, an agent session) and
 // every call is automatically scoped to that entity.
 //
-// Memory owns a Client by composition; it adds no new HTTP routes and changes no
-// existing behavior. Transport, retry, error, and timeout semantics are inherited
+// Memory owns a Client by composition. Text calls compose document routes and
+// media calls use the additive media-memory route. Existing behavior and transport,
+// retry, error, and timeout semantics are inherited
 // unchanged from the underlying Client — Memory surfaces the same error types
 // (*APIError, *NetworkError, sentinels) without additional wrapping.
 //
@@ -53,6 +61,66 @@ type MemoryItem struct {
 	Metadata Metadata
 	// Score is the relevance signal for Recall results, or nil.
 	Score *float64
+	// Modality is "image" or "audio" for a multimodal memory, or nil for text.
+	Modality *string
+}
+
+// MemoryMediaOption configures Memory.RememberImage and Memory.RememberAudio.
+// A Memory convenience accepts bytes, a local path, or an HTTP(S) URL; URL
+// fetches occur in the caller process and are never forwarded to the server.
+type MemoryMediaOption func(*memoryMediaConfig)
+
+type memoryMediaConfig struct {
+	contentType    string
+	filename       string
+	caption        string
+	transcript     string
+	metadata       Metadata
+	source         string
+	autoTranscribe bool
+}
+
+// WithMediaContentType explicitly sets the media MIME type. It is only needed
+// when the SDK cannot infer the type from a path/URL name, HTTP response
+// header, or media magic bytes.
+func WithMediaContentType(contentType string) MemoryMediaOption {
+	return func(c *memoryMediaConfig) { c.contentType = contentType }
+}
+
+// WithMediaFilename sets optional display metadata for the original media.
+func WithMediaFilename(filename string) MemoryMediaOption {
+	return func(c *memoryMediaConfig) { c.filename = filename }
+}
+
+// WithMediaCaption supplies the caller-derived caption for an image memory.
+// A supplied caption bypasses automatic server-side vision processing.
+func WithMediaCaption(caption string) MemoryMediaOption {
+	return func(c *memoryMediaConfig) { c.caption = caption }
+}
+
+// WithMediaTranscript supplies the caller-derived transcript for an audio
+// memory. A supplied transcript bypasses automatic server-side transcription.
+func WithMediaTranscript(transcript string) MemoryMediaOption {
+	return func(c *memoryMediaConfig) { c.transcript = transcript }
+}
+
+// WithMediaMetadata attaches structured metadata to the media memory. It is
+// also mirrored into legacy key:value tags when that representation is lossless.
+func WithMediaMetadata(metadata Metadata) MemoryMediaOption {
+	return func(c *memoryMediaConfig) { c.metadata = metadata }
+}
+
+// WithMediaSource labels the media memory's origin, for example "camera" or
+// "voice-note".
+func WithMediaSource(source string) MemoryMediaOption {
+	return func(c *memoryMediaConfig) { c.source = source }
+}
+
+// WithMediaAutoTranscription controls whether an audio memory without an
+// explicit transcript may use the server's configured transcription processor.
+// It defaults to true. Setting it false requires WithMediaTranscript.
+func WithMediaAutoTranscription(enabled bool) MemoryMediaOption {
+	return func(c *memoryMediaConfig) { c.autoTranscribe = enabled }
 }
 
 const (
@@ -77,6 +145,11 @@ const (
 
 	// forgetAllPageSize is the listing page size used by ForgetAll.
 	forgetAllPageSize = 1000
+
+	defaultThreadTurns    = 10
+	threadSemanticMatches = 5
+	maxThreadTurns        = 1000
+	threadContextMaxBytes = 16 * 1024 * 1024
 )
 
 // MemoryOption configures a Memory beyond the entity id. These apply to both
@@ -173,6 +246,257 @@ func (m *Memory) EntityID() string { return m.entityID }
 // exposed by Memory (e.g. restore).
 func (m *Memory) Client() *Client { return m.client }
 
+// Thread creates an entity-scoped ordered conversation helper. It is
+// equivalent to NewThread(m, threadID).
+func (m *Memory) Thread(threadID string) (*Thread, error) {
+	return NewThread(m, threadID)
+}
+
+// Thread composes a canonical ordered conversation over an entity-scoped
+// Memory. Recent turns and semantic matches are returned as one flat
+// []MemoryItem context list.
+type Thread struct {
+	memory   *Memory
+	threadID string
+}
+
+// NewThread constructs a Thread directly. Memory.Thread is shorthand.
+func NewThread(memory *Memory, threadID string) (*Thread, error) {
+	if memory == nil {
+		return nil, fmt.Errorf("aether: memory cannot be nil")
+	}
+	if err := validateThreadID(threadID); err != nil {
+		return nil, err
+	}
+	return &Thread{memory: memory, threadID: threadID}, nil
+}
+
+// ThreadID returns the canonical conversation identity.
+func (t *Thread) ThreadID() string { return t.threadID }
+
+// Append adds one turn and automatically scopes it to the Memory's entity.
+func (t *Thread) Append(ctx context.Context, text string, metadata any) (*MemoryItem, error) {
+	if strings.TrimSpace(text) == "" {
+		return nil, fmt.Errorf("aether: text cannot be empty")
+	}
+	metadataMap, err := normalizeMemoryMetadata(metadata)
+	if err != nil {
+		return nil, err
+	}
+	doc, err := t.memory.client.AppendThread(ctx, t.threadID, ThreadAppendInput{
+		Text:     text,
+		Metadata: metadataMap,
+		EntityID: t.memory.entityID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	entityID := doc.EntityID
+	if entityID == nil {
+		entityID = &t.memory.entityID
+	}
+	itemMetadata := doc.Metadata
+	if len(itemMetadata) == 0 {
+		itemMetadata = metadataMap
+	}
+	return &MemoryItem{
+		ID:        doc.DocID,
+		Text:      text,
+		CreatedAt: doc.CreatedAt,
+		EntityID:  entityID,
+		Metadata:  itemMetadata,
+	}, nil
+}
+
+// Context returns a bounded recent window followed by up to five additional
+// semantic matches from the same entity and thread. Duplicate document IDs are
+// returned once. lastNTurns=0 uses the default window of ten; otherwise it must
+// be between 1 and 1000. Recent turns are chronological unless recentFirst is
+// true. At most eight downloads run concurrently and recent + semantic content
+// shares a 16 MiB UTF-8/body-byte budget.
+func (t *Thread) Context(
+	ctx context.Context,
+	query string,
+	lastNTurns int,
+	recentFirst bool,
+) ([]MemoryItem, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, fmt.Errorf("aether: query cannot be empty")
+	}
+	if lastNTurns == 0 {
+		lastNTurns = defaultThreadTurns
+	}
+	if lastNTurns < 1 || lastNTurns > maxThreadTurns {
+		return nil, fmt.Errorf("aether: lastNTurns must be between 1 and %d", maxThreadTurns)
+	}
+
+	readOptions := []ThreadReadOption{WithLastNThreadTurns(lastNTurns)}
+	if recentFirst {
+		readOptions = append(readOptions, WithRecentThreadTurns())
+	}
+	var (
+		conversation *ConversationThread
+		matches      []RetrievalResult
+		recentErr    error
+		semanticErr  error
+		wg           sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		conversation, recentErr = t.memory.client.GetThread(ctx, t.threadID, readOptions...)
+	}()
+	go func() {
+		defer wg.Done()
+		matches, semanticErr = t.memory.client.Retrieve(
+			ctx,
+			query,
+			threadSemanticMatches,
+			WithSearchEntityID(t.memory.entityID),
+			WithSearchThreadID(t.threadID),
+		)
+	}()
+	wg.Wait()
+	if recentErr != nil {
+		return nil, recentErr
+	}
+	if semanticErr != nil {
+		return nil, semanticErr
+	}
+
+	records := make([]DocumentRecord, 0, len(conversation.Documents))
+	for _, record := range conversation.Documents {
+		if record.EntityID != nil && *record.EntityID == t.memory.entityID {
+			records = append(records, record)
+		}
+	}
+	texts, contextBytes, err := t.memory.resolveThreadContextTexts(ctx, records)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]MemoryItem, 0, len(records)+len(matches))
+	seen := make(map[string]struct{}, len(records)+len(matches))
+	for index, record := range records {
+		seen[record.DocID] = struct{}{}
+		items = append(items, MemoryItem{
+			ID:        record.DocID,
+			Text:      texts[index],
+			CreatedAt: record.CreatedAt,
+			EntityID:  record.EntityID,
+			Metadata:  record.Metadata,
+		})
+	}
+	for _, match := range matches {
+		if _, exists := seen[match.DocID]; exists {
+			continue
+		}
+		seen[match.DocID] = struct{}{}
+		if contextBytes+len(match.Content) > threadContextMaxBytes {
+			return nil, fmt.Errorf(
+				"aether: thread context exceeds the %d-byte safety limit",
+				threadContextMaxBytes,
+			)
+		}
+		contextBytes += len(match.Content)
+		score := float64(match.Score) / scoreScale
+		entityID := t.memory.entityID
+		items = append(items, MemoryItem{
+			ID:       match.DocID,
+			Text:     match.Content,
+			EntityID: &entityID,
+			Metadata: match.Metadata,
+			Score:    &score,
+		})
+	}
+	return items, nil
+}
+
+// Restore un-tombstones this conversation (the thread-level analog of the raw
+// client's Restore), making its turns visible to Context, Recall, and List
+// again. It is owner/admin-scoped.
+func (t *Thread) Restore(ctx context.Context) (*ThreadLifecycleResult, error) {
+	return t.memory.client.ThreadRestore(ctx, t.threadID)
+}
+
+// SetACL sets the read-ACL applied to this conversation. A nil readers pointer
+// unlabels the thread (tenant-visible); a non-nil pointer to an empty slice
+// quarantines it to admins only; a non-nil pointer to a non-empty slice
+// restricts reads to exactly those principals. It is owner/admin-scoped.
+func (t *Thread) SetACL(ctx context.Context, readers *[]string) (*ThreadLifecycleResult, error) {
+	return t.memory.client.ThreadSetACL(ctx, t.threadID, readers)
+}
+
+// Move re-homes this conversation into another partition. The Memory's current
+// partition is asserted as the expected source (expect_partition); a nil
+// toPartition names the default partition. It is owner/admin-scoped.
+func (t *Thread) Move(ctx context.Context, toPartition *string) (*ThreadLifecycleResult, error) {
+	var expect *string
+	if p := t.memory.client.partition; p != "" {
+		expect = &p
+	}
+	return t.memory.client.ThreadMove(ctx, t.threadID, expect, toPartition)
+}
+
+// Delete tombstones this conversation. By default it is a recoverable soft
+// tombstone (restore with Restore); hard=true performs the irreversible crypto
+// hard delete (right-to-be-forgotten) from which nothing is recoverable. It is
+// owner/admin-scoped.
+func (t *Thread) Delete(ctx context.Context, hard bool) (*ThreadLifecycleResult, error) {
+	return t.memory.client.ThreadDelete(ctx, t.threadID, hard)
+}
+
+// resolveThreadContextTexts preserves turn order, schedules at most eight
+// downloads at a time, and stops before scheduling another batch once the
+// shared UTF-8/body-byte budget is exceeded.
+func (m *Memory) resolveThreadContextTexts(
+	ctx context.Context,
+	records []DocumentRecord,
+) ([]string, int, error) {
+	texts := make([]string, len(records))
+	totalBytes := 0
+	for offset := 0; offset < len(records); offset += recencyGetConcurrency {
+		end := offset + recencyGetConcurrency
+		if end > len(records) {
+			end = len(records)
+		}
+		var (
+			mu       sync.Mutex
+			firstErr error
+			wg       sync.WaitGroup
+		)
+		for index := offset; index < end; index++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				text, err := m.resolveMemoryText(ctx, records[idx])
+				if err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+					return
+				}
+				texts[idx] = text
+			}(index)
+		}
+		wg.Wait()
+		if firstErr != nil {
+			return nil, 0, firstErr
+		}
+		for _, text := range texts[offset:end] {
+			totalBytes += len(text)
+			if totalBytes > threadContextMaxBytes {
+				return nil, 0, fmt.Errorf(
+					"aether: thread context exceeds the %d-byte safety limit",
+					threadContextMaxBytes,
+				)
+			}
+		}
+	}
+	return texts, totalBytes, nil
+}
+
 // Remember stores one memory for this entity. It performs a single HTTP call.
 //
 // metadata (optional) is sent as structured typed document metadata. For older
@@ -219,6 +543,283 @@ func (m *Memory) Remember(ctx context.Context, text string, metadata any) (*Memo
 		Metadata:  doc.Metadata,
 		Score:     nil,
 	}, nil
+}
+
+// RememberImage stores an entity-scoped image memory. source may be []byte, a
+// local path string, an HTTP(S) URL string, or *url.URL. The SDK loads URL/path
+// inputs in the caller process, then sends only the resulting bytes to the
+// authenticated Aether media route.
+//
+// Use WithMediaCaption to supply caller-derived text and avoid automatic server
+// vision processing. Otherwise the server's configured processor derives the
+// indexed caption.
+func (m *Memory) RememberImage(ctx context.Context, source any, opts ...MemoryMediaOption) (*MemoryItem, error) {
+	return m.rememberMediaSource(ctx, source, "image", opts...)
+}
+
+// RememberAudio stores an entity-scoped audio memory. source may be []byte, a
+// local path string, an HTTP(S) URL string, or *url.URL. The SDK loads URL/path
+// inputs in the caller process, then sends only the resulting bytes to the
+// authenticated Aether media route.
+//
+// Use WithMediaTranscript to supply caller-derived text and avoid automatic
+// server transcription. Automatic transcription is enabled by default;
+// WithMediaAutoTranscription(false) requires an explicit transcript.
+func (m *Memory) RememberAudio(ctx context.Context, source any, opts ...MemoryMediaOption) (*MemoryItem, error) {
+	return m.rememberMediaSource(ctx, source, "audio", opts...)
+}
+
+func (m *Memory) rememberMediaSource(ctx context.Context, source any, modality string, opts ...MemoryMediaOption) (*MemoryItem, error) {
+	cfg := memoryMediaConfig{autoTranscribe: true}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if modality == "image" && cfg.transcript != "" {
+		return nil, fmt.Errorf("aether: transcript is valid only for audio memories")
+	}
+	if modality == "audio" && cfg.caption != "" {
+		return nil, fmt.Errorf("aether: caption is valid only for image memories")
+	}
+	if modality == "audio" && !cfg.autoTranscribe && cfg.transcript == "" {
+		return nil, fmt.Errorf("aether: automatic transcription disabled; provide a transcript")
+	}
+
+	media, contentType, filename, err := loadMemoryMediaSource(
+		ctx, m.client, source, modality, cfg.contentType, cfg.filename,
+	)
+	if err != nil {
+		return nil, err
+	}
+	tags, err := encodeMetadataTags(cfg.metadata)
+	if err != nil {
+		return nil, err
+	}
+	record, err := m.client.RememberMedia(ctx, media, MediaMemoryOptions{
+		Modality:    modality,
+		ContentType: contentType,
+		EntityID:    m.entityID,
+		Filename:    filename,
+		Caption:     cfg.caption,
+		Transcript:  cfg.transcript,
+		Tags:        tags,
+		Metadata:    cfg.metadata,
+		Source:      cfg.source,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	entityID := m.entityID
+	if record.EntityID != nil && *record.EntityID != "" {
+		entityID = *record.EntityID
+	}
+	returnedModality := record.Modality
+	if returnedModality == "" {
+		returnedModality = modality
+	}
+	metadata := record.Metadata
+	if len(metadata) == 0 && len(cfg.metadata) > 0 {
+		metadata = cfg.metadata
+	}
+	return &MemoryItem{
+		ID:        record.DocID,
+		Text:      record.DerivedText,
+		CreatedAt: record.CreatedAt,
+		EntityID:  &entityID,
+		Metadata:  metadata,
+		Score:     nil,
+		Modality:  &returnedModality,
+	}, nil
+}
+
+// loadMemoryMediaSource normalizes a supported Memory media source to bytes.
+// It deliberately uses a plain HTTP request for caller URLs, never Client's
+// authenticated request helper, so an Aether API key is not sent to arbitrary
+// media hosts.
+func loadMemoryMediaSource(
+	ctx context.Context,
+	client *Client,
+	source any,
+	modality, explicitContentType, explicitFilename string,
+) ([]byte, string, string, error) {
+	if u, ok := source.(*url.URL); ok {
+		if u == nil {
+			return nil, "", "", fmt.Errorf("aether: media source cannot be nil")
+		}
+		source = u.String()
+	}
+
+	filename := explicitFilename
+	var (
+		data                []byte
+		detectedContentType string
+		err                 error
+	)
+	switch value := source.(type) {
+	case []byte:
+		data = value
+	case string:
+		if parsed, isHTTPURL := parseMemoryMediaURL(value); isHTTPURL {
+			req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+			if reqErr != nil {
+				return nil, "", "", fmt.Errorf("aether: create media URL request: %w", reqErr)
+			}
+			httpClient := http.DefaultClient
+			if client != nil && client.httpClient != nil {
+				httpClient = client.httpClient
+			}
+			resp, requestErr := httpClient.Do(req)
+			if requestErr != nil {
+				return nil, "", "", fmt.Errorf("aether: fetch media URL: %w", requestErr)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+				return nil, "", "", fmt.Errorf("aether: media URL returned HTTP %d", resp.StatusCode)
+			}
+			data, err = io.ReadAll(resp.Body)
+			if err != nil {
+				return nil, "", "", fmt.Errorf("aether: read media URL: %w", err)
+			}
+			detectedContentType = resp.Header.Get("Content-Type")
+			if filename == "" {
+				filename = filenameFromMediaURL(parsed)
+			}
+		} else {
+			data, err = os.ReadFile(value)
+			if err != nil {
+				return nil, "", "", fmt.Errorf("aether: read media path %q: %w", value, err)
+			}
+			if filename == "" {
+				filename = filepath.Base(value)
+			}
+		}
+	default:
+		return nil, "", "", fmt.Errorf("aether: media source must be []byte, a local path, or an HTTP(S) URL")
+	}
+	if len(data) == 0 {
+		return nil, "", "", fmt.Errorf("aether: media cannot be empty")
+
+	}
+
+	contentType := normalizeMediaContentType(explicitContentType)
+	if contentType == "" {
+		candidate := normalizeMediaContentType(detectedContentType)
+		if strings.HasPrefix(candidate, modality+"/") {
+			contentType = candidate
+		}
+	}
+	if contentType == "" {
+		contentType = mediaContentTypeFromFilename(filename, modality)
+	}
+	if contentType == "" {
+		contentType = sniffMediaContentType(data, modality)
+	}
+	if contentType == "" {
+		return nil, "", "", fmt.Errorf("aether: contentType is required for unrecognized media bytes")
+	}
+	return data, contentType, filename, nil
+}
+
+func parseMemoryMediaURL(raw string) (*url.URL, bool) {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return nil, false
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	return parsed, scheme == "http" || scheme == "https"
+}
+
+func filenameFromMediaURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	filename := path.Base(u.Path)
+	if filename == "." || filename == "/" {
+		return ""
+	}
+	return filename
+}
+
+func mediaContentTypeFromFilename(filename, modality string) string {
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case ".jpg", ".jpeg":
+		if modality == "image" {
+			return "image/jpeg"
+		}
+	case ".png":
+		if modality == "image" {
+			return "image/png"
+		}
+	case ".webp":
+		if modality == "image" {
+			return "image/webp"
+		}
+	case ".gif":
+		if modality == "image" {
+			return "image/gif"
+		}
+	case ".mp3":
+		if modality == "audio" {
+			return "audio/mpeg"
+		}
+	case ".m4a", ".mp4":
+		if modality == "audio" {
+			return "audio/mp4"
+		}
+	case ".wav":
+		if modality == "audio" {
+			return "audio/wav"
+		}
+	case ".webm":
+		if modality == "audio" {
+			return "audio/webm"
+		}
+	case ".ogg":
+		if modality == "audio" {
+			return "audio/ogg"
+		}
+	case ".flac":
+		if modality == "audio" {
+			return "audio/flac"
+		}
+	}
+	return ""
+}
+
+func sniffMediaContentType(data []byte, modality string) string {
+	hasPrefix := func(prefix ...byte) bool { return bytes.HasPrefix(data, prefix) }
+	hasASCII := func(offset int, value string) bool {
+		return offset >= 0 && len(data) >= offset+len(value) && string(data[offset:offset+len(value)]) == value
+	}
+	if modality == "image" {
+		switch {
+		case hasPrefix(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a):
+			return "image/png"
+		case hasPrefix(0xff, 0xd8, 0xff):
+			return "image/jpeg"
+		case hasASCII(0, "GIF87a") || hasASCII(0, "GIF89a"):
+			return "image/gif"
+		case hasASCII(0, "RIFF") && hasASCII(8, "WEBP"):
+			return "image/webp"
+		}
+		return ""
+	}
+
+	switch {
+	case hasASCII(0, "RIFF") && hasASCII(8, "WAVE"):
+		return "audio/wav"
+	case hasASCII(0, "ID3") || hasPrefix(0xff, 0xfb) || hasPrefix(0xff, 0xf3) || hasPrefix(0xff, 0xf2):
+		return "audio/mpeg"
+	case hasASCII(0, "OggS"):
+		return "audio/ogg"
+	case hasASCII(0, "fLaC"):
+		return "audio/flac"
+	case hasPrefix(0x1a, 0x45, 0xdf, 0xa3):
+		return "audio/webm"
+	case hasASCII(4, "ftyp"):
+		return "audio/mp4"
+	}
+	return ""
 }
 
 func normalizeMemoryMetadata(metadata any) (Metadata, error) {
@@ -386,6 +987,7 @@ func (m *Memory) recallSimple(ctx context.Context, query string, k int, searchOp
 			EntityID:  &entityID,
 			Metadata:  h.Metadata,
 			Score:     &score,
+			Modality:  h.Modality,
 		})
 	}
 	return items, nil
@@ -398,6 +1000,7 @@ type recallCandidate struct {
 	score     int
 	metadata  Metadata
 	createdAt *string
+	modality  *string
 	blended   float64
 }
 
@@ -426,6 +1029,7 @@ func (m *Memory) recallRecency(ctx context.Context, query string, k int, w float
 			text:     h.Content,
 			score:    h.Score,
 			metadata: h.Metadata,
+			modality: h.Modality,
 		}
 	}
 
@@ -470,6 +1074,7 @@ func (m *Memory) recallRecency(ctx context.Context, query string, k int, w float
 			EntityID:  &entityID,
 			Metadata:  c.metadata,
 			Score:     &blended,
+			Modality:  c.modality,
 		})
 	}
 	return items, nil
@@ -623,10 +1228,11 @@ func WithListFilter(filter MetadataFilter) MemoryListOption {
 
 // List returns a chronological view of this entity's memories, newest first.
 //
-// Cost note: List is 1 + N calls — one listing plus one content download per
-// returned memory (the listing endpoint returns metadata without text). Memories
-// are short and the entity's set is usually small; limit bounds the work. Callers
-// who only need metadata can drop to the raw client's List with an entity filter.
+// Cost note: List is 1 + N calls for text memories — one listing plus one content
+// download per text memory. Media memories use their authorized derived_text
+// caption/transcript from the list response instead of decoding original binary
+// downloads. Callers who only need metadata can drop to the raw client's List
+// with an entity filter.
 func (m *Memory) List(ctx context.Context, opts ...MemoryListOption) ([]MemoryItem, error) {
 	cfg := memoryListConfig{limit: 50}
 	for _, o := range opts {
@@ -649,7 +1255,7 @@ func (m *Memory) List(ctx context.Context, opts ...MemoryListOption) ([]MemoryIt
 		records = records[:cfg.limit]
 	}
 
-	texts, err := m.downloadTexts(ctx, records)
+	texts, err := m.resolveMemoryTexts(ctx, records)
 	if err != nil {
 		return nil, err
 	}
@@ -663,6 +1269,7 @@ func (m *Memory) List(ctx context.Context, opts ...MemoryListOption) ([]MemoryIt
 			EntityID:  r.EntityID,
 			Metadata:  r.Metadata,
 			Score:     nil,
+			Modality:  r.Modality,
 		})
 	}
 	return items, nil
@@ -705,7 +1312,7 @@ func (m *Memory) ListExtractedFacts(ctx context.Context, opts ...MemoryListOptio
 		records = records[:cfg.limit]
 	}
 
-	texts, err := m.downloadTexts(ctx, records)
+	texts, err := m.resolveMemoryTexts(ctx, records)
 	if err != nil {
 		return nil, err
 	}
@@ -719,6 +1326,7 @@ func (m *Memory) ListExtractedFacts(ctx context.Context, opts ...MemoryListOptio
 			EntityID:  r.EntityID,
 			Metadata:  r.Metadata,
 			Score:     nil,
+			Modality:  r.Modality,
 		})
 	}
 	return items, nil
@@ -745,9 +1353,10 @@ func derefStr(s *string) string {
 	return *s
 }
 
-// downloadTexts downloads each record's text, preserving order, bounded by
-// recencyGetConcurrency. The first error encountered is returned.
-func (m *Memory) downloadTexts(ctx context.Context, records []DocumentRecord) ([]string, error) {
+// resolveMemoryTexts resolves each record's retrieval-safe text, preserving
+// order and bounding concurrent work. Text records use DownloadText; media
+// records use derived_text (or a metadata Get fallback), never binary download.
+func (m *Memory) resolveMemoryTexts(ctx context.Context, records []DocumentRecord) ([]string, error) {
 	texts := make([]string, len(records))
 	var (
 		mu       sync.Mutex
@@ -762,11 +1371,11 @@ func (m *Memory) downloadTexts(ctx context.Context, records []DocumentRecord) ([
 	for i, r := range records {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(idx int, docID string) {
+		go func(idx int, record DocumentRecord) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			text, err := m.client.DownloadText(cctx, docID)
+			text, err := m.resolveMemoryText(cctx, record)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -777,7 +1386,7 @@ func (m *Memory) downloadTexts(ctx context.Context, records []DocumentRecord) ([
 				return
 			}
 			texts[idx] = text
-		}(i, r.DocID)
+		}(i, r)
 	}
 	wg.Wait()
 
@@ -785,6 +1394,30 @@ func (m *Memory) downloadTexts(ctx context.Context, records []DocumentRecord) ([
 		return nil, firstErr
 	}
 	return texts, nil
+}
+
+// resolveMemoryText returns text safe for a Memory item. Download returns the
+// original media asset, so media documents must use their indexed derived text
+// rather than converting binary bytes to a string.
+func (m *Memory) resolveMemoryText(ctx context.Context, record DocumentRecord) (string, error) {
+	if record.Modality == nil {
+		return m.client.DownloadText(ctx, record.DocID)
+	}
+	if record.DerivedText != nil {
+		return *record.DerivedText, nil
+	}
+
+	// New servers include derived_text in list responses. A metadata Get keeps
+	// the no-binary-download guarantee for an otherwise compatible response that
+	// omitted it.
+	doc, err := m.client.Get(ctx, record.DocID)
+	if err != nil {
+		return "", err
+	}
+	if doc.DerivedText == nil {
+		return "", fmt.Errorf("aether: media memory %s has no derived_text", record.DocID)
+	}
+	return *doc.DerivedText, nil
 }
 
 // Forget deletes a single memory by id (a soft tombstone, restorable via the raw

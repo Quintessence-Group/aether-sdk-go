@@ -552,6 +552,206 @@ func TestLineageNotFound(t *testing.T) {
 	}
 }
 
+func TestGroundingReceipt(t *testing.T) {
+	var createPath, revokePath string
+	sourceContentID := "aether:private-cid"
+	var createBody struct {
+		Answer       string   `json:"answer"`
+		SourceDocIDs []string `json:"source_doc_ids"`
+		Partition    string   `json:"partition"`
+		Share        bool     `json:"share"`
+	}
+	_, client := jsonServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			createPath = r.URL.Path
+			if err := json.NewDecoder(r.Body).Decode(&createBody); err != nil {
+				t.Fatalf("decode receipt request: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(GroundingReceipt{
+				AnswerDigest: "blake3:answer-commitment",
+				Sources: []GroundingSource{{
+					DocumentID: "doc-1", ContentID: "aether:private-cid", Rank: 0,
+					RetainedSignedEventCount: 2, CurrentContentVerified: true,
+					Proof: &AuditProof{
+						ContentID: &sourceContentID, Lamport: 42, NodeID: "source-node-id",
+						PublicKey: "source-public-key", Signature: "source-signature", Verified: true,
+					},
+				}},
+				Trust: GroundingTrustSignal{
+					Status: "verified", SourcesRequested: 1, SourcesVerified: 1, AnswerBound: true,
+				},
+				Binding: GroundingBinding{
+					Algorithm:           "blake3-keyed/aether-grounding-binding/v1",
+					SourceSetCommitment: "blake3:sources", SourceEvidenceCommitment: "blake3:evidence",
+					BindingCommitment: "opaque", VerificationSalt: "authenticated-only-salt",
+				},
+				Attestation: GroundingSetAttestation{
+					Version: "aether-grounding-set-attestation/v1", IssuedAt: "2026-07-10T00:00:00Z",
+					BindingAlgorithm: "blake3-keyed/aether-grounding-binding/v1",
+					SignerNodeID:     "grounding-node-id", SignerPublicKey: "grounding-public-key",
+					Signature: "grounding-signature", Verified: true,
+				},
+				Receipt: &ShareableReceipt{
+					Version: "aether-grounding-receipt/v2", ReceiptID: "receipt-1",
+					IssuedAt: "2026-07-10T00:00:00Z", ExpiresAt: "2026-08-09T00:00:00Z", SourceCount: 1, VerifiedSourceCount: 1,
+					Status: "verified", BindingCommitment: "opaque",
+					CapabilityCommitment: "blake3:capability", OwnerCommitment: "blake3:owner",
+					ShareURL: "/receipts/capability", BadgeURL: "/receipts/capability/badge.svg",
+					Attestation: ReceiptAttestation{SignerNodeID: "node-id", SignerPublicKey: "public-key", Signature: "signature", Verified: true},
+				},
+			})
+		case http.MethodDelete:
+			revokePath = r.URL.Path
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	})
+
+	receipt, err := client.CreateGroundingReceipt(context.Background(), "private answer", []string{"doc-1"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if createPath != "/v1/audit/grounding" {
+		t.Errorf("expected /v1/audit/grounding, got %s", createPath)
+	}
+	if createBody.Answer != "private answer" || len(createBody.SourceDocIDs) != 1 || createBody.SourceDocIDs[0] != "doc-1" || !createBody.Share {
+		t.Errorf("unexpected request body: %+v", createBody)
+	}
+	if receipt.Trust.Status != "verified" || receipt.Receipt == nil || receipt.Receipt.ShareURL != "/receipts/capability" || !receipt.Receipt.Attestation.Verified {
+		t.Errorf("unexpected receipt: %+v", receipt)
+	}
+	if receipt.Sources[0].Proof == nil || receipt.Sources[0].Proof.Lamport != 42 || !receipt.Sources[0].Proof.Verified {
+		t.Errorf("expected exported source proof fields, got %+v", receipt.Sources[0].Proof)
+	}
+	if receipt.Binding.SourceEvidenceCommitment != "blake3:evidence" {
+		t.Errorf("expected evidence commitment, got %q", receipt.Binding.SourceEvidenceCommitment)
+	}
+	if receipt.Attestation.Signature != "grounding-signature" || !receipt.Attestation.Verified {
+		t.Errorf("expected top-level grounding attestation, got %+v", receipt.Attestation)
+	}
+	if receipt.Receipt.CapabilityCommitment != "blake3:capability" || receipt.Receipt.OwnerCommitment != "blake3:owner" {
+		t.Errorf("expected capability and owner commitments, got %+v", receipt.Receipt)
+	}
+
+	if err := client.RevokeGroundingReceipt(context.Background(), "receipt-1"); err != nil {
+		t.Fatal(err)
+	}
+	if revokePath != "/v1/audit/receipts/receipt-1" {
+		t.Errorf("expected versioned revoke path, got %s", revokePath)
+	}
+}
+
+func TestGroundingReceiptPartitionHandleInjectsBodyAndRevokeGuard(t *testing.T) {
+	var createPartition, revokePartition string
+	_, base := jsonServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			var body struct {
+				Partition string `json:"partition"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			createPartition = body.Partition
+			_ = json.NewEncoder(w).Encode(GroundingReceipt{})
+		case http.MethodDelete:
+			revokePartition = r.URL.Query().Get("partition")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	})
+	scoped, err := base.Partition("customer-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scoped.CreateGroundingReceipt(context.Background(), "answer", []string{"doc-1"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := scoped.RevokeGroundingReceipt(context.Background(), "receipt-1"); err != nil {
+		t.Fatal(err)
+	}
+	if createPartition != "customer-a" || revokePartition != "customer-a" {
+		t.Fatalf("expected scoped receipt operations, got create=%q revoke=%q", createPartition, revokePartition)
+	}
+}
+
+func TestGroundingReceiptValidatesInputs(t *testing.T) {
+	client := NewClient("http://localhost:9000")
+	if _, err := client.CreateGroundingReceipt(context.Background(), "", []string{"doc-1"}, false); err == nil {
+		t.Fatal("expected empty answer validation error")
+	}
+	if _, err := client.CreateGroundingReceipt(context.Background(), "answer", nil, false); err == nil {
+		t.Fatal("expected empty source list validation error")
+	}
+	if err := client.RevokeGroundingReceipt(context.Background(), ""); err == nil {
+		t.Fatal("expected empty receipt id validation error")
+	}
+}
+
+func TestGroundingReceiptShareDoesNotRetryTransientResponse(t *testing.T) {
+	for _, status := range []int{http.StatusBadGateway, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			attempts := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				w.Header().Set("Content-Type", "application/json")
+				if attempts == 1 {
+					w.WriteHeader(status)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("first-%d", status)})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(GroundingReceipt{AnswerDigest: "unexpected"})
+			}))
+			t.Cleanup(srv.Close)
+			client := NewClient(srv.URL, WithMaxRetries(2), WithRetryBackoff(time.Nanosecond))
+
+			_, err := client.CreateGroundingReceipt(context.Background(), "answer", []string{"doc-1"}, true)
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("expected APIError, got %T (%v)", err, err)
+			}
+			if apiErr.StatusCode != status || apiErr.Message != fmt.Sprintf("first-%d", status) {
+				t.Fatalf("expected first %d error, got %+v", status, apiErr)
+			}
+			if attempts != 1 {
+				t.Fatalf("share issuance must make exactly one request, got %d", attempts)
+			}
+		})
+	}
+}
+
+func TestGroundingReceiptPrivateRetainsTransientRetry(t *testing.T) {
+	for _, status := range []int{http.StatusBadGateway, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			attempts := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				w.Header().Set("Content-Type", "application/json")
+				if attempts == 1 {
+					w.WriteHeader(status)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("transient-%d", status)})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(GroundingReceipt{AnswerDigest: "blake3:retried"})
+			}))
+			t.Cleanup(srv.Close)
+			client := NewClient(srv.URL, WithMaxRetries(2), WithRetryBackoff(time.Nanosecond))
+
+			receipt, err := client.CreateGroundingReceipt(context.Background(), "answer", []string{"doc-1"}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if receipt.AnswerDigest != "blake3:retried" || attempts != 2 {
+				t.Fatalf("expected retry success after two calls, receipt=%+v attempts=%d", receipt, attempts)
+			}
+		})
+	}
+}
+
 // ── Download ──────────────────────────────────────────────────────
 
 func TestDownload(t *testing.T) {
@@ -1282,6 +1482,7 @@ func TestBatchSearchQueryFilters(t *testing.T) {
 			Q:           "a",
 			K:           3,
 			EntityID:    "user-1",
+			ThreadID:    "support-42",
 			Since:       "2026-01-01T00:00:00Z",
 			Until:       "2026-06-01T00:00:00Z",
 			MaxDistance: 0.4,
@@ -1293,6 +1494,7 @@ func TestBatchSearchQueryFilters(t *testing.T) {
 	}
 	for _, want := range []string{
 		`"entity_id":"user-1"`,
+		`"thread_id":"support-42"`,
 		`"since":"2026-01-01T00:00:00Z"`,
 		`"until":"2026-06-01T00:00:00Z"`,
 		`"max_distance":0.4`,
@@ -1304,6 +1506,27 @@ func TestBatchSearchQueryFilters(t *testing.T) {
 	}
 	if strings.Count(gotBody, `"entity_id"`) != 1 {
 		t.Errorf("expected entity_id omitted for the query without one, got %s", gotBody)
+	}
+	if strings.Count(gotBody, `"thread_id"`) != 1 {
+		t.Errorf("expected thread_id omitted for the query without one, got %s", gotBody)
+	}
+}
+
+func TestBatchSearchRejectsInvalidThreadIDBeforeRequest(t *testing.T) {
+	called := false
+	_, client := jsonServer(t, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []map[string]any{}})
+	})
+
+	_, err := client.BatchSearch(context.Background(), []BatchSearchQuery{
+		{Q: "test", ThreadID: "bad\x00thread"},
+	})
+	if err == nil {
+		t.Fatal("expected invalid thread id error")
+	}
+	if called {
+		t.Fatal("invalid thread id reached transport")
 	}
 }
 
@@ -2477,13 +2700,18 @@ func TestPartitionScopedBodyRoutes(t *testing.T) {
 	// batch_search → per-query body field, same partition on every query.
 	gotBody = ""
 	if _, err := scoped.BatchSearch(ctx, []BatchSearchQuery{
-		{Q: "one", K: 1},
-		{Q: "two", K: 1},
+		{Q: "one", K: 1, ThreadID: "thread-one"},
+		{Q: "two", K: 1, ThreadID: "thread-two"},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if n := strings.Count(gotBody, `"partition":"tenant-x"`); n != 2 {
 		t.Errorf("batch_search: expected partition on every query (2), got %d in %s", n, gotBody)
+	}
+	for _, threadID := range []string{"thread-one", "thread-two"} {
+		if !strings.Contains(gotBody, `"thread_id":"`+threadID+`"`) {
+			t.Errorf("batch_search: expected %s in scoped query body, got %s", threadID, gotBody)
+		}
 	}
 }
 

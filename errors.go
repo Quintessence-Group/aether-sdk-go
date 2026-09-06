@@ -34,6 +34,19 @@ const (
 	// partition guard. Not retryable — it is a programming error, not a
 	// transient failure.
 	CodePartitionRequired = "partition_required"
+
+	// CodeSessionInvalid is returned with HTTP 400 when a connect-session
+	// token is unknown, already consumed, or expired. The three cases are
+	// deliberately indistinguishable — mint a new session with
+	// CreateConnectSession rather than retrying the same token.
+	CodeSessionInvalid = "session_invalid"
+
+	// CodePartitionMismatch is returned with HTTP 400 when
+	// CreateConnectSession's asserted partition (from a partition handle)
+	// disagrees with the partition the session would actually resolve to.
+	// Mint on a handle scoped to the same externalUserID, or omit the
+	// handle.
+	CodePartitionMismatch = "partition_mismatch"
 )
 
 // Sentinel errors. Use with errors.Is to branch on the specific failure
@@ -47,6 +60,12 @@ var (
 	// ErrPartitionRequired matches a 400 from a multi-tenant key that made an
 	// unscoped call. Scope the call through Partition("<id>") and retry.
 	ErrPartitionRequired = errors.New("aether: partition required — scope the call through Partition(id)")
+	// ErrSessionInvalid matches a 400 from a connect-session token that is
+	// unknown, already consumed, or expired.
+	ErrSessionInvalid = errors.New("aether: connect session invalid, consumed, or expired")
+	// ErrPartitionMismatch matches a 400 from CreateConnectSession when the
+	// handle's asserted partition disagrees with the resolved placement.
+	ErrPartitionMismatch = errors.New("aether: asserted partition does not match the session's resolved partition")
 )
 
 // APIError is returned when the Aether API responds with a non-2xx status code.
@@ -78,6 +97,10 @@ func (e *APIError) Is(target error) bool {
 		return e.ErrorCode == CodeTenantPaused
 	case ErrPartitionRequired:
 		return e.ErrorCode == CodePartitionRequired
+	case ErrSessionInvalid:
+		return e.ErrorCode == CodeSessionInvalid
+	case ErrPartitionMismatch:
+		return e.ErrorCode == CodePartitionMismatch
 	}
 	return false
 }

@@ -30,6 +30,11 @@ type DocumentRecord struct {
 	// EntityID is the optional identifier of the entity (e.g. a user or
 	// customer) the document belongs to.
 	EntityID *string `json:"entity_id,omitempty"`
+	// ThreadID is the conversation identity when this document is a
+	// thread turn. Nil for an ordinary document.
+	ThreadID *string `json:"thread_id,omitempty"`
+	// TurnIndex is the server-assigned zero-based position within ThreadID.
+	TurnIndex *uint64 `json:"turn_index,omitempty"`
 	// Tags is the list of metadata tags attached to the document.
 	Tags []string `json:"tags,omitempty"`
 	// Source is the optional origin label for the document (e.g. "slack",
@@ -40,10 +45,81 @@ type DocumentRecord struct {
 	Partition *string `json:"partition,omitempty"`
 	// Metadata is the structured metadata attached to the document.
 	Metadata Metadata `json:"metadata,omitempty"`
+	// Modality is "image" or "audio" when this document is a multimodal
+	// memory. Nil for ordinary text documents.
+	Modality *string `json:"modality,omitempty"`
+	// DerivedText is the indexed caption or transcript for a multimodal memory.
+	// The original media bytes remain available through Download.
+	DerivedText *string `json:"derived_text,omitempty"`
 	// CreatedAt is the RFC 3339 timestamp when the document was first inserted.
 	CreatedAt *string `json:"created_at,omitempty"`
 	// UpdatedAt is the RFC 3339 timestamp when the document was last modified.
 	UpdatedAt *string `json:"updated_at,omitempty"`
+}
+
+// MediaMemoryRecord is returned after storing image or audio bytes through
+// Client.RememberMedia. DerivedText is the caption or transcript indexed for
+// semantic retrieval; the original media bytes remain available through
+// Download.
+type MediaMemoryRecord struct {
+	// DocID is the identifier of the stored media document.
+	DocID string `json:"doc_id"`
+	// CID is the content-addressed identifier of the stored media document.
+	CID string `json:"cid"`
+	// Modality is either "image" or "audio".
+	Modality string `json:"modality"`
+	// ContentType is the validated MIME type of the original media bytes.
+	ContentType string `json:"content_type"`
+	// DerivedText is the caption or transcript indexed for mixed retrieval.
+	DerivedText string `json:"derived_text"`
+	// DerivedBy identifies whether a caller or configured processor supplied
+	// DerivedText. It never contains provider credentials.
+	DerivedBy string `json:"derived_by"`
+	// CreatedAt is the RFC 3339 timestamp when the media memory was stored.
+	CreatedAt *string `json:"created_at,omitempty"`
+	// EntityID is the entity scope associated with the memory.
+	EntityID *string `json:"entity_id,omitempty"`
+	// Partition is the document partition, nil for the default partition.
+	Partition *string `json:"partition,omitempty"`
+	// Metadata is the structured metadata attached to the media memory.
+	Metadata Metadata `json:"metadata,omitempty"`
+}
+
+// ConversationThread is the canonical tenant-scoped conversation returned by
+// Client.GetThread, ordered by the server-assigned turn index by default.
+type ConversationThread struct {
+	ThreadID  string           `json:"thread_id"`
+	Documents []DocumentRecord `json:"documents"`
+}
+
+// ThreadLifecycleResult is the engine's response to a whole-thread lifecycle
+// mutation — ThreadRestore, ThreadSetACL, ThreadMove, or ThreadDelete (and their
+// Thread facade equivalents Restore / SetACL / Move / Delete).
+type ThreadLifecycleResult struct {
+	// Status is the applied action: "tombstoned", "restored", "acl_updated",
+	// "hard_deleted", or "moved".
+	Status string `json:"status"`
+	// ThreadID is the conversation the op applied to.
+	ThreadID string `json:"thread_id"`
+	// Turns is the number of turns whose canonical marker (tombstone / ACL /
+	// partition) was rewritten by the op.
+	Turns int `json:"turns"`
+}
+
+// ThreadAppendInput is one logical append request. IdempotencyKey is sent in
+// the HTTP header rather than JSON; leave it empty to let the client mint one
+// stable key reused across this call's transport retries.
+type ThreadAppendInput struct {
+	Text     string   `json:"text"`
+	Metadata Metadata `json:"metadata,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
+	EntityID string   `json:"entity_id,omitempty"`
+	Source   string   `json:"source,omitempty"`
+	// ACLReaders distinguishes omission (nil: tenant-visible) from an explicit
+	// empty slice (non-nil pointer to []: admin-only quarantine).
+	ACLReaders     *[]string `json:"acl_readers,omitempty"`
+	Filename       string    `json:"filename,omitempty"`
+	IdempotencyKey string    `json:"-"`
 }
 
 // AuditProof is the cryptographic provenance attached to an AuditRecord. It
@@ -89,6 +165,92 @@ type AuditRecord struct {
 	Proof AuditProof `json:"proof"`
 }
 
+// GroundingSource is one tenant-private document/memory source in an answer's
+// declared grounding set. It is returned only by CreateGroundingReceipt, never
+// by the public share URL.
+type GroundingSource struct {
+	DocumentID               string `json:"document_id"`
+	ContentID                string `json:"content_id"`
+	Rank                     int    `json:"rank"`
+	RetainedSignedEventCount int    `json:"retained_signed_event_count"`
+	CurrentContentVerified   bool   `json:"current_content_verified"`
+	// Proof is existing engine-verified lineage evidence for the CID; it is not
+	// a standalone LedgerEvent signing transcript.
+	Proof *AuditProof `json:"proof,omitempty"`
+}
+
+// GroundingTrustSignal reports integrity evidence for a declared grounding
+// set. Status "verified" means retained signed source evidence was valid when
+// created; it does not rate factual correctness or model reasoning.
+type GroundingTrustSignal struct {
+	Status           string `json:"status"`
+	SourcesRequested int    `json:"sources_requested"`
+	SourcesVerified  int    `json:"sources_verified"`
+	AnswerBound      bool   `json:"answer_bound"`
+}
+
+// GroundingBinding is authenticated-only verification material for the opaque
+// receipt commitment. VerificationSalt is never returned by the public share
+// URL; retain it with the original answer/source result to recompute a binding.
+type GroundingBinding struct {
+	Algorithm                string `json:"algorithm"`
+	SourceSetCommitment      string `json:"source_set_commitment"`
+	SourceEvidenceCommitment string `json:"source_evidence_commitment"`
+	BindingCommitment        string `json:"binding_commitment"`
+	VerificationSalt         string `json:"verification_salt"`
+}
+
+// ReceiptAttestation is the public Ed25519 node attestation over public-safe
+// receipt fields.
+type ReceiptAttestation struct {
+	SignerNodeID    string `json:"signer_node_id"`
+	SignerPublicKey string `json:"signer_public_key"`
+	Signature       string `json:"signature"`
+	Verified        bool   `json:"verified"`
+}
+
+// GroundingSetAttestation is the Ed25519 attestation over every authenticated
+// grounding result, including non-shareable results.
+type GroundingSetAttestation struct {
+	Version          string `json:"version"`
+	IssuedAt         string `json:"issued_at"`
+	BindingAlgorithm string `json:"binding_algorithm"`
+	SignerNodeID     string `json:"signer_node_id"`
+	SignerPublicKey  string `json:"signer_public_key"`
+	Signature        string `json:"signature"`
+	Verified         bool   `json:"verified"`
+}
+
+// ShareableReceipt contains aggregate-only share link metadata. Its public URL
+// never discloses answer text/digest, tenant ID, document IDs, CIDs, titles,
+// passages, or raw ledger events.
+type ShareableReceipt struct {
+	Version              string             `json:"version"`
+	ReceiptID            string             `json:"receipt_id"`
+	IssuedAt             string             `json:"issued_at"`
+	ExpiresAt            string             `json:"expires_at"`
+	SourceCount          int                `json:"source_count"`
+	VerifiedSourceCount  int                `json:"verified_source_count"`
+	Status               string             `json:"status"`
+	BindingCommitment    string             `json:"binding_commitment"`
+	CapabilityCommitment string             `json:"capability_commitment"`
+	OwnerCommitment      string             `json:"owner_commitment"`
+	Attestation          ReceiptAttestation `json:"attestation"`
+	ShareURL             string             `json:"share_url"`
+	BadgeURL             string             `json:"badge_url"`
+}
+
+// GroundingReceipt is the authenticated answer-grounding response.
+// Receipt is nil unless callers explicitly request shareable proof.
+type GroundingReceipt struct {
+	AnswerDigest string                  `json:"answer_digest"`
+	Sources      []GroundingSource       `json:"sources"`
+	Trust        GroundingTrustSignal    `json:"trust"`
+	Binding      GroundingBinding        `json:"binding"`
+	Attestation  GroundingSetAttestation `json:"attestation"`
+	Receipt      *ShareableReceipt       `json:"receipt,omitempty"`
+}
+
 // IngestResult is the outcome of ingesting a single file via IngestFiles or
 // IngestDirectory. There is exactly one result per input path, returned in
 // the same order as the inputs.
@@ -131,6 +293,11 @@ type SearchResult struct {
 	// EntityID is the optional owning entity the matched document is scoped to.
 	// Nil when the document is unscoped.
 	EntityID *string `json:"entity_id,omitempty"`
+	// ThreadID is the conversation identity when this hit is a
+	// thread turn. Nil for an ordinary document.
+	ThreadID *string `json:"thread_id,omitempty"`
+	// TurnIndex is the server-assigned zero-based position within ThreadID.
+	TurnIndex *uint64 `json:"turn_index,omitempty"`
 	// ContentType is the MIME type of the matched document.
 	ContentType string `json:"content_type"`
 	// Content is the full document content, populated when include_content is
@@ -157,6 +324,9 @@ type SearchResult struct {
 	// modified. Nil when not reported. Kept as a raw string to match the rest of
 	// the SDK's timestamp handling.
 	UpdatedAt *string `json:"updated_at,omitempty"`
+	// Modality is "image" or "audio" when this hit is a multimodal memory.
+	// Nil for ordinary text hits.
+	Modality *string `json:"modality,omitempty"`
 	// QueryID is the feedback handle for the search that returned this hit.
 	// Present only when usage-feedback capture is enabled for your tenant (nil
 	// otherwise); pass it to Client.SendSearchFeedback together with DocID.
@@ -177,6 +347,11 @@ type RetrievalResult struct {
 	// EntityID is the optional owning entity the matched document is scoped to.
 	// Nil when the document is unscoped.
 	EntityID *string `json:"entity_id,omitempty"`
+	// ThreadID is the conversation identity when this retrieval result is a
+	// thread turn. Nil for an ordinary document.
+	ThreadID *string `json:"thread_id,omitempty"`
+	// TurnIndex is the server-assigned zero-based position within ThreadID.
+	TurnIndex *uint64 `json:"turn_index,omitempty"`
 	// ContentType is the MIME type of the matched document.
 	ContentType string `json:"content_type"`
 	// Passage is the specific text chunk that matched the query.
@@ -198,6 +373,10 @@ type RetrievalResult struct {
 	// UpdatedAt is the RFC 3339 timestamp when the matched document was last
 	// modified. Nil when not reported.
 	UpdatedAt *string `json:"updated_at,omitempty"`
+	// Modality is "image" or "audio" when this result is a multimodal memory.
+	// Content always contains the indexed caption/transcript, never decoded
+	// original media bytes.
+	Modality *string `json:"modality,omitempty"`
 }
 
 // InsertWithEmbeddingsOptions configures a bring-your-own-embeddings (BYOE) insert.
@@ -386,6 +565,9 @@ type BatchSearchQuery struct {
 	// EntityID filters results to documents associated with the given
 	// entity id. Empty means no entity filter.
 	EntityID string `json:"entity_id,omitempty"`
+	// ThreadID restricts results to one canonical conversation thread.
+	// Empty means no thread filter.
+	ThreadID string `json:"thread_id,omitempty"`
 	// Since filters results to documents created at or after this RFC 3339
 	// timestamp (inclusive). Empty means no lower bound.
 	Since string `json:"since,omitempty"`
@@ -481,6 +663,7 @@ type batchSearchQueryWire struct {
 	Filter         MetadataFilter `json:"filter,omitempty"`
 	IncludeContent bool           `json:"include_content,omitempty"`
 	EntityID       string         `json:"entity_id,omitempty"`
+	ThreadID       string         `json:"thread_id,omitempty"`
 	Since          string         `json:"since,omitempty"`
 	Until          string         `json:"until,omitempty"`
 	LastNDays      int            `json:"last_n_days,omitempty"`
@@ -529,6 +712,24 @@ type backfillEntityRequest struct {
 type moveDocumentRequest struct {
 	ToPartition     *string `json:"to_partition"`
 	ExpectPartition *string `json:"expect_partition"`
+}
+
+// threadMoveRequest is the wire body of POST /threads/{thread_id}/move. Like
+// moveDocumentRequest, both fields are always present on the wire — an explicit
+// null names the default partition and an omitted field is a 400 — so neither
+// carries omitempty.
+type threadMoveRequest struct {
+	ToPartition     *string `json:"to_partition"`
+	ExpectPartition *string `json:"expect_partition"`
+}
+
+// threadACLRequest is the wire body of PUT /threads/{thread_id}/acl. The single
+// field is always present on the wire — an explicit null unlabels the thread
+// (tenant-visible), an empty array quarantines it to admins only, and a
+// non-empty array restricts reads to exactly those principals — so it never
+// carries omitempty.
+type threadACLRequest struct {
+	ACLReaders *[]string `json:"acl_readers"`
 }
 
 // ── Partition lifecycle ───────────────────────────────────────────
@@ -633,4 +834,149 @@ type tracedSearchResponse struct {
 // partitionDeleteResponse is the on-the-wire shape of a partition delete.
 type partitionDeleteResponse struct {
 	DocumentsDeleted int `json:"documents_deleted"`
+}
+
+// ── Connections + connect sessions ────
+
+// ConnectSession is the result of Client.CreateConnectSession.
+type ConnectSession struct {
+	// SessionToken is opaque and single-use. Embedded in ConnectURL.
+	SessionToken string `json:"session_token"`
+	// ConnectURL should be opened in the end user's browser to start the
+	// hosted OAuth flow.
+	ConnectURL string `json:"connect_url"`
+	// ClientSecret is returned exactly once. Store it server-side; use it
+	// with VerifyConnectRedirectSignature when the flow completes.
+	ClientSecret string `json:"client_secret"`
+	ExpiresAt    string `json:"expires_at"`
+}
+
+// ListConnectionsOptions filters Client.ListConnections.
+type ListConnectionsOptions struct {
+	// OwnerType narrows to "tenant" or "external_user".
+	OwnerType string
+	// OwnerID narrows to one end user's connections; implies
+	// OwnerType == "external_user" when OwnerType is empty.
+	OwnerID string
+	// IncludePurged defaults to true (via IncludePurgedSet); set both to
+	// false to list only live connections.
+	IncludePurged    bool
+	IncludePurgedSet bool
+}
+
+// Connection is a developer's own source (mode A) or one end user's (mode
+// B). It never carries credential material.
+type Connection struct {
+	ConnectionID       string  `json:"connection_id"`
+	Provider           string  `json:"provider"`
+	OwnerType          string  `json:"owner_type"`
+	OwnerID            *string `json:"owner_id"`
+	ProviderAccountID  string  `json:"provider_account_id"`
+	AccountDisplayName *string `json:"account_display_name"`
+	// TargetPartition is nil for mode A (the tenant's default partition);
+	// the end user's id for mode B.
+	TargetPartition *string  `json:"target_partition"`
+	Status          string   `json:"status"`
+	GrantedScopes   []string `json:"granted_scopes"`
+	CreatedAt       string   `json:"created_at"`
+	LastSyncAt      *string  `json:"last_sync_at"`
+	LastError       *string  `json:"last_error"`
+	FilesSynced     int      `json:"files_synced"`
+	FilesSkipped    int      `json:"files_skipped"`
+	FilesDeleted    int      `json:"files_deleted"`
+	SelectedPaths   []string `json:"selected_paths"`
+	// PurgeState is "not_started", "in_flight", or "complete".
+	PurgeState        string  `json:"purge_state"`
+	PurgeReceiptID    *string `json:"purge_receipt_id"`
+	CredentialDeleted bool    `json:"credential_deleted"`
+	// IdentityRedacted is true when this row's provider-side identity was
+	// withheld because the call was not scoped to the connection's partition:
+	// ProviderAccountID is then "" and AccountDisplayName empty. Every other
+	// field is real. Pass the partition — the same scope the by-id routes
+	// require — to get the identity. Always false for mode-A connections and
+	// on by-id reads.
+	IdentityRedacted bool `json:"identity_redacted"`
+}
+
+// PurgeSummary summarizes what a disconnect destroyed.
+type PurgeSummary struct {
+	ReceiptID       string `json:"receipt_id"`
+	DocumentsPurged int    `json:"documents_purged"`
+	MerkleRoot      string `json:"merkle_root"`
+	CompletedAt     string `json:"completed_at"`
+	SignerNodeID    string `json:"signer_node_id"`
+}
+
+// DisconnectResult is the result of Client.DeleteConnection.
+type DisconnectResult struct {
+	ConnectionID string `json:"connection_id"`
+	Status       string `json:"status"`
+	// Purge is nil only when the connection did not exist (the idempotent
+	// no-op) — a disconnect that ran always produces a receipt.
+	Purge *PurgeSummary `json:"purge"`
+}
+
+// ConnectionPurgeReceipt is the full signed proof returned by
+// Client.GetPurgeReceipt.
+type ConnectionPurgeReceipt struct {
+	Version                 string   `json:"version"`
+	ReceiptID               string   `json:"receipt_id"`
+	TenantID                string   `json:"tenant_id"`
+	ConnectionID            string   `json:"connection_id"`
+	Provider                string   `json:"provider"`
+	Owner                   string   `json:"owner"`
+	ProviderAccountID       string   `json:"provider_account_id"`
+	DocumentsPurged         int      `json:"documents_purged"`
+	DocumentsFailed         int      `json:"documents_failed"`
+	MerkleRoot              string   `json:"merkle_root"`
+	MerkleLeafCount         int      `json:"merkle_leaf_count"`
+	PurgedDocumentIDs       []string `json:"purged_document_ids"`
+	PartitionsTouched       []string `json:"partitions_touched"`
+	DefaultPartitionTouched bool     `json:"default_partition_touched"`
+	CredentialRevocation    string   `json:"credential_revocation"`
+	CredentialDeleted       bool     `json:"credential_deleted"`
+	StartedAt               string   `json:"started_at"`
+	CompletedAt             string   `json:"completed_at"`
+	SignerNodeID            string   `json:"signer_node_id"`
+	SignerPublicKey         string   `json:"signer_public_key"`
+	Signature               string   `json:"signature"`
+	// Verified is the node's own re-verification of the row at read time.
+	Verified bool `json:"verified"`
+}
+
+// ConnectionBrowseEntry is one entry in a Client.BrowseConnection page.
+type ConnectionBrowseEntry struct {
+	Name        string  `json:"name"`
+	PathDisplay string  `json:"path_display"`
+	IsFolder    bool    `json:"is_folder"`
+	SizeBytes   *int64  `json:"size_bytes"`
+	Modified    *string `json:"modified"`
+}
+
+// ConnectionBrowsePage is one page of Client.BrowseConnection.
+type ConnectionBrowsePage struct {
+	Entries []ConnectionBrowseEntry `json:"entries"`
+	// NextCursor is present iff another page exists; pass back as the next
+	// call's cursor.
+	NextCursor *string `json:"next_cursor"`
+}
+
+// connectionListResponse is the on-the-wire shape of GET /v1/connections.
+type connectionListResponse struct {
+	Connections []Connection `json:"connections"`
+}
+
+// resyncResponse is the on-the-wire shape of POST
+// /v1/connections/{id}/resync — slim; Client.ResyncConnection re-fetches
+// the full record.
+type resyncResponse struct {
+	ConnectionID string `json:"connection_id"`
+	Status       string `json:"status"`
+}
+
+// selectionResponse is the on-the-wire shape of PUT
+// /v1/connections/{id}/selection.
+type selectionResponse struct {
+	ConnectionID  string   `json:"connection_id"`
+	SelectedPaths []string `json:"selected_paths"`
 }
