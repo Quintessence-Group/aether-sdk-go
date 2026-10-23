@@ -24,7 +24,7 @@ import (
 )
 
 // Version is the SDK version, sent in the User-Agent header.
-const Version = "0.6.0"
+const Version = "0.7.0"
 
 // userAgent identifies the SDK + version + Go runtime so the server can
 // attribute traffic, track version adoption, and target deprecations.
@@ -306,8 +306,25 @@ func (c *Client) doBody(ctx context.Context, method, path, contentType string, b
 }
 
 func (c *Client) doBodyWithIdempotency(ctx context.Context, method, path, contentType string, body io.Reader, result any, idempotencyKey string) error {
+	_, err := c.doBodyWithHeaders(ctx, method, path, contentType, body, result, idempotencyKey, nil)
+	return err
+}
+
+// doBodyWithHeaders is the retrying transport behind every doBody variant. It
+// additionally sends headers (the memory-file and summary preconditions
+// If-Match / If-None-Match) on every attempt and returns the headers of a 2xx
+// response (for ETag). idempotencyKey is sent on every attempt when non-empty;
+// a POST without one gets a freshly minted key.
+func (c *Client) doBodyWithHeaders(
+	ctx context.Context,
+	method, path, contentType string,
+	body io.Reader,
+	result any,
+	idempotencyKey string,
+	headers http.Header,
+) (http.Header, error) {
 	if c.cfgErr != nil {
-		return c.cfgErr
+		return nil, c.cfgErr
 	}
 	// Buffer the body so it can be replayed on retry.
 	var bodyBytes []byte
@@ -315,7 +332,7 @@ func (c *Client) doBodyWithIdempotency(ctx context.Context, method, path, conten
 		var err error
 		bodyBytes, err = io.ReadAll(body)
 		if err != nil {
-			return &NetworkError{Err: err}
+			return nil, &NetworkError{Err: err}
 		}
 	}
 
@@ -332,33 +349,37 @@ func (c *Client) doBodyWithIdempotency(ctx context.Context, method, path, conten
 			bodyReader = bytes.NewReader(bodyBytes)
 			ct = contentType
 		}
-		return c.newRequest(ctx, method, path, idempotencyKey, ct, bodyReader)
+		req, err := c.newRequest(ctx, method, path, idempotencyKey, ct, bodyReader)
+		if err != nil {
+			return nil, err
+		}
+		for name, values := range headers {
+			for _, v := range values {
+				req.Header.Add(name, v)
+			}
+		}
+		return req, nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
-		return &NetworkError{Err: err}
+		return nil, &NetworkError{Err: err}
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if result != nil {
 			if err := json.Unmarshal(respBody, result); err != nil {
-				return fmt.Errorf("aether: failed to decode response: %w", err)
+				return nil, fmt.Errorf("aether: failed to decode response: %w", err)
 			}
 		}
-		return nil
+		return resp.Header, nil
 	}
 
-	var errResp errorResponse
-	msg := resp.Status
-	if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != "" {
-		msg = errResp.Error
-	}
-	return &APIError{StatusCode: resp.StatusCode, Message: msg, ErrorCode: errResp.Code}
+	return nil, apiErrorFromResponse(resp, respBody)
 }
 
 func (c *Client) sleepBackoff(ctx context.Context, attempt int, resp *http.Response) {
@@ -473,12 +494,7 @@ func (c *Client) doBodyNoRetry(ctx context.Context, method, path, contentType st
 		return nil
 	}
 
-	var errResp errorResponse
-	msg := resp.Status
-	if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != "" {
-		msg = errResp.Error
-	}
-	return &APIError{StatusCode: resp.StatusCode, Message: msg, ErrorCode: errResp.Code}
+	return apiErrorFromResponse(resp, respBody)
 }
 
 func (c *Client) doRaw(ctx context.Context, path string) ([]byte, error) {
@@ -499,12 +515,7 @@ func (c *Client) doRaw(ctx context.Context, path string) ([]byte, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var errResp errorResponse
-		msg := resp.Status
-		if json.Unmarshal(data, &errResp) == nil && errResp.Error != "" {
-			msg = errResp.Error
-		}
-		return nil, &APIError{StatusCode: resp.StatusCode, Message: msg, ErrorCode: errResp.Code}
+		return nil, apiErrorFromResponse(resp, data)
 	}
 
 	return data, nil
@@ -525,6 +536,8 @@ type insertConfig struct {
 	entityID     string
 	source       string
 	extractFacts bool
+	// summarize is the tri-state summarize flag: nil leaves the tenant default.
+	summarize *bool
 }
 
 // InsertOption configures an insert operation.
@@ -574,6 +587,23 @@ func WithExtractFacts(enabled bool) InsertOption {
 	return func(c *insertConfig) { c.extractFacts = enabled }
 }
 
+// WithSummarize requests (true) or suppresses (false) a background summary of
+// the inserted document, overriding the tenant default; without it the tenant
+// default applies. The summary is generated after the insert commits and never
+// fails or delays it: the returned DocumentRecord.Summary reports "pending" or
+// "skipped", and GetSummary reads the outcome. Applies to Insert, InsertText,
+// InsertStream, InsertAsync and BatchInsert; Update rejects it.
+func WithSummarize(enabled bool) InsertOption {
+	return func(c *insertConfig) { c.summarize = &enabled }
+}
+
+// applySummarizeParam sends summarize=true|false when the flag was set.
+func applySummarizeParam(params url.Values, cfg insertConfig) {
+	if cfg.summarize != nil {
+		params.Set("summarize", strconv.FormatBool(*cfg.summarize))
+	}
+}
+
 func setJSONParam(params url.Values, key string, value any) error {
 	switch v := value.(type) {
 	case nil:
@@ -618,6 +648,7 @@ func applyInsertParams(params url.Values, cfg insertConfig) error {
 	if cfg.extractFacts {
 		params.Set("extract_facts", "true")
 	}
+	applySummarizeParam(params, cfg)
 	return nil
 }
 
@@ -984,6 +1015,7 @@ func (c *Client) InsertStream(ctx context.Context, r io.Reader, filename, conten
 	if err := setJSONParam(params, "metadata", cfg.metadata); err != nil {
 		return nil, err
 	}
+	applySummarizeParam(params, cfg)
 	c.applyPartitionParam(params)
 	var doc DocumentRecord
 	err := c.doJSONNoRetry(ctx, http.MethodPost, "/documents?"+params.Encode(), r, &doc)
@@ -1019,6 +1051,9 @@ func (c *Client) Update(ctx context.Context, docID string, data []byte, filename
 	var cfg insertConfig
 	for _, o := range opts {
 		o(&cfg)
+	}
+	if cfg.summarize != nil {
+		return nil, fmt.Errorf("aether: WithSummarize is not valid for Update")
 	}
 	params := url.Values{
 		"filename":     {filename},
@@ -1644,10 +1679,12 @@ func (c *Client) SendSearchFeedback(ctx context.Context, queryID, docID, signal 
 
 // Retrieve performs a search and returns results enriched with retrieval-safe
 // text. Results are deduplicated by DocID (highest-scoring match wins). Content
-// is returned inline when the server supports it; text results otherwise fall
-// back to downloading the document. Media downloads are original binary assets,
-// so media results use their indexed caption/transcript passage (or a metadata
-// Get fallback) instead of decoding binary bytes as text.
+// is returned inline when the server supports it. Otherwise text-like documents
+// are downloaded, and other types (PDF, Office, HTML, CSV, …) are read through
+// GetText, falling back to the matched passage on a 404 or an "unsupported"
+// state. Media downloads are original binary assets, so media results use their
+// indexed caption/transcript passage (or a metadata Get fallback) instead of
+// decoding binary bytes as text.
 func (c *Client) Retrieve(ctx context.Context, query string, k int, opts ...SearchOption) ([]RetrievalResult, error) {
 	if query == "" {
 		return nil, fmt.Errorf("aether: query cannot be empty")
@@ -1692,11 +1729,18 @@ func (c *Client) Retrieve(ctx context.Context, query string, k int, opts ...Sear
 				content = *doc.DerivedText
 			}
 		} else {
-			downloaded, err := c.DownloadText(ctx, r.DocID)
-			if err != nil {
-				return nil, fmt.Errorf("aether: failed to download doc %s: %w", r.DocID, err)
+			// Never decode a binary original: text-like types are downloaded,
+			// anything else (PDF, Office, …) is read through GetText, falling
+			// back to the matched passage.
+			fallback := ""
+			if r.Passage != nil {
+				fallback = *r.Passage
 			}
-			content = downloaded
+			text, err := c.hydrateDocumentText(ctx, r.DocID, r.ContentType, fallback)
+			if err != nil {
+				return nil, fmt.Errorf("aether: failed to read doc %s: %w", r.DocID, err)
+			}
+			content = text
 		}
 		out = append(out, RetrievalResult{
 			DocID:       r.DocID,
@@ -1715,6 +1759,7 @@ func (c *Client) Retrieve(ctx context.Context, query string, k int, opts ...Sear
 			CreatedAt:   r.CreatedAt,
 			UpdatedAt:   r.UpdatedAt,
 			Modality:    r.Modality,
+			MemoryFile:  r.MemoryFile,
 		})
 	}
 	return out, nil
@@ -2170,7 +2215,9 @@ func (c *Client) WaitForJob(ctx context.Context, jobID string, timeout, pollInte
 
 // BatchInsert uploads multiple documents in a single request and returns a
 // DocumentRecord for each successfully inserted document. Chunking options
-// (WithChunking) apply uniformly to all documents in the batch.
+// (WithChunking) apply uniformly to all documents in the batch. WithSummarize
+// sets the batch-wide summarize default; BatchInsertItem.Summarize overrides it
+// per document.
 func (c *Client) BatchInsert(ctx context.Context, documents []BatchInsertItem, opts ...InsertOption) ([]DocumentRecord, error) {
 	if len(documents) == 0 {
 		return nil, fmt.Errorf("aether: documents cannot be empty")
@@ -2188,11 +2235,13 @@ func (c *Client) BatchInsert(ctx context.Context, documents []BatchInsertItem, o
 			EntityID:  d.EntityID,
 			Source:    d.Source,
 			Metadata:  d.Metadata,
+			Summarize: d.Summarize,
 			Partition: c.partition,
 		}
 	}
 	payload := batchInsertRequest{
 		Documents: items,
+		Summarize: cfg.summarize,
 	}
 	if cfg.chunkSize > 0 {
 		payload.ChunkSize = &cfg.chunkSize

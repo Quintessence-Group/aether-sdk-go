@@ -36,6 +36,9 @@ type Memory struct {
 	entityID     string
 	halfLifeDays float64
 	extractFacts bool
+	// summarize is the tri-state summarize default for Remember: nil leaves
+	// the tenant default in effect.
+	summarize *bool
 	// now is an injectable clock for deterministic recency scoring in tests.
 	// It defaults to func() time.Time { return time.Now().UTC() }.
 	now func() time.Time
@@ -177,6 +180,16 @@ func WithFactExtraction(enabled bool) MemoryOption {
 	return func(m *Memory) { m.extractFacts = enabled }
 }
 
+// WithSummarization requests (true) or suppresses (false) a background summary
+// of every text memory stored by Remember, overriding the tenant default;
+// without it the tenant default applies. The flag applies to every Remember on
+// this Memory (Go has no per-call override); use the raw client's WithSummarize
+// insert option for one-off control. Summaries never fail or delay Remember;
+// read one with Client.GetSummary.
+func WithSummarization(enabled bool) MemoryOption {
+	return func(m *Memory) { m.summarize = &enabled }
+}
+
 // WithClock injects a clock used for recency scoring. It is test-only/advanced;
 // the default is the system UTC time. A nil function is ignored.
 func WithClock(now func() time.Time) MemoryOption {
@@ -215,11 +228,11 @@ func newMemory(entityID string, client *Client, opts ...MemoryOption) (*Memory, 
 
 // NewMemory builds a Memory with its own Client constructed from the given client
 // options (the same options accepted by New, e.g. WithAPIKey, WithBaseURL).
-// Memory-specific options (WithHalfLife, WithFactExtraction, WithClock) are not
-// accepted here; use NewMemoryWithClient when you need them, or set the half-life
-// via the underlying client is not applicable. The entity id is validated
-// client-side (non-empty, 1-256 chars) — an invalid id returns an error without a
-// network round-trip.
+// Memory-specific options (WithHalfLife, WithFactExtraction, WithSummarization,
+// WithClock) are not accepted here; use NewMemoryWithClient when you need them,
+// or set the half-life via the underlying client is not applicable. The entity
+// id is validated client-side (non-empty, 1-256 chars) — an invalid id returns
+// an error without a network round-trip.
 func NewMemory(entityID string, opts ...Option) (*Memory, error) {
 	if err := validateEntityID(entityID); err != nil {
 		return nil, err
@@ -229,9 +242,10 @@ func NewMemory(entityID string, opts ...Option) (*Memory, error) {
 
 // NewMemoryWithClient builds a Memory around an already-configured Client
 // (dependency injection). Use this to share one client across many entities, and
-// in tests. Memory-specific options (WithHalfLife, WithFactExtraction, WithClock)
-// are applied here. The entity id is validated client-side (non-empty, 1-256
-// chars) — an invalid id returns an error without a network round-trip.
+// in tests. Memory-specific options (WithHalfLife, WithFactExtraction,
+// WithSummarization, WithClock) are applied here. The entity id is validated
+// client-side (non-empty, 1-256 chars) — an invalid id returns an error without
+// a network round-trip.
 func NewMemoryWithClient(entityID string, c *Client, opts ...MemoryOption) (*Memory, error) {
 	if c == nil {
 		return nil, fmt.Errorf("aether: client cannot be nil")
@@ -507,7 +521,8 @@ func (m *Memory) resolveThreadContextTexts(
 //
 // When fact extraction is enabled (WithFactExtraction), the inserted text is
 // distilled server-side into atomic facts, each stored as a sibling "kind:fact"
-// memory; the returned item is still the raw memory (not the facts).
+// memory; the returned item is still the raw memory (not the facts). When
+// WithSummarization was given, summarize is sent with that value.
 func (m *Memory) Remember(ctx context.Context, text string, metadata any) (*MemoryItem, error) {
 	if strings.TrimSpace(text) == "" {
 		return nil, fmt.Errorf("aether: text cannot be empty")
@@ -529,6 +544,9 @@ func (m *Memory) Remember(ctx context.Context, text string, metadata any) (*Memo
 	}
 	if m.extractFacts {
 		opts = append(opts, WithExtractFacts(true))
+	}
+	if m.summarize != nil {
+		opts = append(opts, WithSummarize(*m.summarize))
 	}
 	doc, err := m.client.InsertText(ctx, text, "", opts...)
 	if err != nil {
@@ -1255,7 +1273,7 @@ func (m *Memory) List(ctx context.Context, opts ...MemoryListOption) ([]MemoryIt
 		records = records[:cfg.limit]
 	}
 
-	texts, err := m.resolveMemoryTexts(ctx, records)
+	texts, err := m.resolveMemoryTexts(ctx, records, m.resolveListText)
 	if err != nil {
 		return nil, err
 	}
@@ -1312,7 +1330,8 @@ func (m *Memory) ListExtractedFacts(ctx context.Context, opts ...MemoryListOptio
 		records = records[:cfg.limit]
 	}
 
-	texts, err := m.resolveMemoryTexts(ctx, records)
+	// Extracted facts are always text/plain: download as before.
+	texts, err := m.resolveMemoryTexts(ctx, records, m.resolveMemoryText)
 	if err != nil {
 		return nil, err
 	}
@@ -1353,10 +1372,13 @@ func derefStr(s *string) string {
 	return *s
 }
 
-// resolveMemoryTexts resolves each record's retrieval-safe text, preserving
-// order and bounding concurrent work. Text records use DownloadText; media
-// records use derived_text (or a metadata Get fallback), never binary download.
-func (m *Memory) resolveMemoryTexts(ctx context.Context, records []DocumentRecord) ([]string, error) {
+// resolveMemoryTexts resolves each record's retrieval-safe text with resolve,
+// preserving order and bounding concurrent work.
+func (m *Memory) resolveMemoryTexts(
+	ctx context.Context,
+	records []DocumentRecord,
+	resolve func(context.Context, DocumentRecord) (string, error),
+) ([]string, error) {
 	texts := make([]string, len(records))
 	var (
 		mu       sync.Mutex
@@ -1375,7 +1397,7 @@ func (m *Memory) resolveMemoryTexts(ctx context.Context, records []DocumentRecor
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			text, err := m.resolveMemoryText(cctx, record)
+			text, err := resolve(cctx, record)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -1396,13 +1418,34 @@ func (m *Memory) resolveMemoryTexts(ctx context.Context, records []DocumentRecor
 	return texts, nil
 }
 
-// resolveMemoryText returns text safe for a Memory item. Download returns the
-// original media asset, so media documents must use their indexed derived text
-// rather than converting binary bytes to a string.
+// resolveMemoryText returns text safe for a text/plain Memory record (thread
+// turns, extracted facts) or a media record. Download returns the original
+// media asset, so media documents must use their indexed derived text rather
+// than converting binary bytes to a string.
 func (m *Memory) resolveMemoryText(ctx context.Context, record DocumentRecord) (string, error) {
 	if record.Modality == nil {
 		return m.client.DownloadText(ctx, record.DocID)
 	}
+	return m.resolveMediaText(ctx, record)
+}
+
+// resolveListText returns a Memory.List item's text: media records use their
+// derived text; any other record is read by content type — text-like types are
+// downloaded, other types (PDF, Office, …) through GetText, falling back to ""
+// when no text is available.
+func (m *Memory) resolveListText(ctx context.Context, record DocumentRecord) (string, error) {
+	if record.Modality != nil {
+		return m.resolveMediaText(ctx, record)
+	}
+	fallback := ""
+	if record.DerivedText != nil {
+		fallback = *record.DerivedText
+	}
+	return m.client.hydrateDocumentText(ctx, record.DocID, record.ContentType, fallback)
+}
+
+// resolveMediaText returns a media record's caption/transcript.
+func (m *Memory) resolveMediaText(ctx context.Context, record DocumentRecord) (string, error) {
 	if record.DerivedText != nil {
 		return *record.DerivedText, nil
 	}

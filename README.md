@@ -114,3 +114,134 @@ Binary-format parsing is handled automatically server-side — no setup required
 ## License
 
 MIT
+
+### Memory files
+
+Memory files are **named, versioned markdown files** that belong to the entity — a
+running `memory.md` of agreed terms, a `preferences.md`, a project log. Read a file
+whole, by section or page by page; replace it with a version precondition or edit
+it section by section; list its versions, diff them and grep across files. Every
+write creates a new version and keeps the previous ones.
+
+```go
+files := mem.Files()
+
+// Create the file (fails with *VersionConflictError if it already exists).
+files.Write(ctx, "memory.md", "# Acme memory\n\n## Agreed terms\n", aether.WithCreateOnly())
+
+// Append and AppendSection need no precondition: they apply atomically to
+// the current version, so concurrent writers never lose an entry.
+files.AppendSection(ctx, "memory.md", "Agreed terms", "- 2026-10-10 — Net 45 for EU entities")
+files.Append(ctx, "memory.md", "- Follow up next week")
+
+// Read the whole file, one section, or only the outline.
+file, _ := files.Read(ctx, "memory.md")
+terms, _ := files.Read(ctx, "memory.md", aether.WithFileSection("Agreed terms"))
+outline, _ := files.Read(ctx, "memory.md", aether.WithFileOutline())
+
+// Replace one section's body.
+files.ReplaceSection(ctx, "memory.md", "Agreed terms", "- Net 60",
+	aether.WithExpectedVersion(file.Version))
+
+// History, diffs and search.
+versions, _ := files.Versions(ctx, "memory.md")
+diff, _ := files.Diff(ctx, "memory.md") // current version vs the one before
+hits, _ := files.Grep(ctx, `net\s+\d+`, aether.WithRegex(), aether.WithIgnoreCase())
+
+// Erase every version.
+files.Delete(ctx, "memory.md", aether.WithHardDelete())
+```
+
+To rewrite a file safely, read it, edit the content, and write it back with the
+version you read; if another writer got there first, read again and retry:
+
+```go
+for {
+	file, err := files.Read(ctx, "memory.md")
+	if err != nil {
+		return err
+	}
+	edited := strings.ReplaceAll(file.Content, "Net 30", "Net 45")
+	_, err = files.Write(ctx, "memory.md", edited, aether.WithExpectedVersion(file.Version))
+	var conflict *aether.VersionConflictError
+	if errors.As(err, &conflict) {
+		continue // conflict.CurrentVersion is the newer version
+	}
+	return err
+}
+```
+
+- **Names** are 1–128 letters, digits, `.`, `_` or `-`, starting with a letter or
+  digit, without `..`, and not `grep` (case-sensitive). `aether.ValidateMemoryFileName`
+  checks one; every method rejects an invalid name before sending a request.
+- **`Write` and `ReplaceSection` need exactly one precondition**:
+  `WithExpectedVersion(v)` to replace version `v`, or `WithCreateOnly()` to create the
+  file. `Append` and `AppendSection` need none (pass `WithExpectedVersion` to make
+  them conditional anyway). A stale version fails with `*aether.VersionConflictError`
+  (`errors.Is(err, aether.ErrVersionConflict)` also works).
+- **Writes are safe to retry.** Each write sends an `Idempotency-Key` that is reused
+  across the client's automatic retries, so a retried write is applied at most once
+  (`WithIdempotencyKey` sets your own). Writing content identical to the current
+  version writes nothing and returns `Unchanged: true`.
+- **Across entities**, the raw client lists and searches every entity under an id
+  prefix: `client.ListMemoryFiles(ctx, aether.WithFileEntityPrefix("acme:customer:"))`
+  and `client.GrepMemoryFiles(ctx, "Net 45", aether.WithGrepEntityPrefix("acme:customer:"))`.
+- **Delete is soft by default**: the file disappears from reads, lists, grep and
+  search, and writing the name again continues its numbering. `WithHardDelete()`
+  irreversibly purges every version.
+- Search hits on a memory file carry `MemoryFile` (name, version and section).
+- A 404 whose `ErrorCode` is `aether.CodeFeatureNotEnabled` means memory files
+  aren't enabled on your deployment.
+
+### Reading a document's text
+
+`GetText` returns the parsed, readable text of any stored document — the original
+for text types, the caption or transcript for media, and text rebuilt from the
+parsed passages for PDF/Office — paged and addressable by section:
+
+```go
+outline, _ := client.GetText(ctx, docID, aether.WithOutline())
+for _, s := range outline.Sections {
+	fmt.Println(s.Heading)
+}
+
+terms, _ := client.GetText(ctx, docID, aether.WithTextSection("Payment terms"))
+fmt.Println(terms.Text)
+
+page, _ := client.GetText(ctx, docID, aether.WithMaxBytes(65536))
+for page.Truncated {
+	page, _ = client.GetText(ctx, docID, aether.WithOffset(*page.NextOffset), aether.WithMaxBytes(65536))
+}
+```
+
+### Document summaries
+
+Aether can keep a short markdown summary next to a document. Ask for one at insert
+with `WithSummarize(true)` (`false` suppresses it; without the option the tenant
+default applies). It is generated in the background after the insert commits, so it
+never fails or slows the insert: `DocumentRecord.Summary` reports `"pending"` or
+`"skipped"`. `WithSummarize` also applies to `Insert`, `InsertStream`, `InsertAsync`
+(`JobStatus.SummaryState`) and `BatchInsert` (plus `BatchInsertItem.Summarize` per
+document).
+
+```go
+doc, _ := client.InsertText(ctx, contract, "msa.md", aether.WithSummarize(true))
+
+summary, _ := client.GetSummary(ctx, doc.DocID)
+if summary.State == "ready" {
+	fmt.Println(*summary.Content)
+}
+
+// Write your own (user-authored) summary. WithExpectedRevision(rev) makes it
+// conditional on the stored summary's Revision.
+client.PutSummary(ctx, doc.DocID, "## Summary\n- Net 30, renews yearly.\n")
+
+// Queue a fresh generated summary; force replaces a user-authored one.
+client.RegenerateSummary(ctx, doc.DocID, true)
+```
+
+`State` is `none`, `pending`, `ready`, `failed`, `skipped` (by policy, e.g. a short
+document) or `unsupported`. `Content` stays readable while a regeneration is pending
+or after one failed, and `Stale` is true once the document has changed since the
+summary was written. A 404 whose `ErrorCode` is `aether.CodeFeatureNotEnabled` means
+summaries aren't enabled on your deployment.
