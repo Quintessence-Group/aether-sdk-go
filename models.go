@@ -55,6 +55,10 @@ type DocumentRecord struct {
 	CreatedAt *string `json:"created_at,omitempty"`
 	// UpdatedAt is the RFC 3339 timestamp when the document was last modified.
 	UpdatedAt *string `json:"updated_at,omitempty"`
+	// Summary reports a summary requested at insert (WithSummarize): "pending"
+	// when it was queued, "skipped" when policy skipped it. Nil when no summary
+	// was requested. Read the outcome with Client.GetSummary.
+	Summary *string `json:"summary,omitempty"`
 }
 
 // MediaMemoryRecord is returned after storing image or audio bytes through
@@ -331,6 +335,23 @@ type SearchResult struct {
 	// Present only when usage-feedback capture is enabled for your tenant (nil
 	// otherwise); pass it to Client.SendSearchFeedback together with DocID.
 	QueryID *string `json:"query_id,omitempty"`
+	// MemoryFile identifies the memory file (and best-effort section) when this
+	// hit is the current version of a memory file. Nil for any other hit.
+	MemoryFile *MemoryFileHit `json:"memory_file,omitempty"`
+}
+
+// MemoryFileHit identifies the memory file a search hit came from.
+type MemoryFileHit struct {
+	// Name is the memory file's name.
+	Name string `json:"name"`
+	// Version is the file version the hit was matched in (always the current
+	// one).
+	Version int `json:"version"`
+	// Section is the heading of the innermost section containing the match,
+	// or nil when unknown or in the text before the first heading.
+	Section *string `json:"section"`
+	// SectionSlug is that section's slug, or nil.
+	SectionSlug *string `json:"section_slug"`
 }
 
 // RetrievalResult extends SearchResult with document content for RAG workflows.
@@ -377,6 +398,9 @@ type RetrievalResult struct {
 	// Content always contains the indexed caption/transcript, never decoded
 	// original media bytes.
 	Modality *string `json:"modality,omitempty"`
+	// MemoryFile identifies the memory file when this result is one; nil
+	// otherwise.
+	MemoryFile *MemoryFileHit `json:"memory_file,omitempty"`
 }
 
 // InsertWithEmbeddingsOptions configures a bring-your-own-embeddings (BYOE) insert.
@@ -520,6 +544,9 @@ type JobStatus struct {
 	DocID *string `json:"doc_id,omitempty"`
 	// Error is the failure reason, set when the job status is "failed".
 	Error *string `json:"error,omitempty"`
+	// SummaryState reports a summary requested at insert (WithSummarize) once
+	// the job completes: "pending" or "skipped". Nil when none was requested.
+	SummaryState *string `json:"summary_state,omitempty"`
 }
 
 // BatchInsertItem represents a single document in a batch insert request.
@@ -539,6 +566,10 @@ type BatchInsertItem struct {
 	Source string `json:"source,omitempty"`
 	// Metadata is structured metadata for filtering in list/search.
 	Metadata Metadata `json:"metadata,omitempty"`
+	// Summarize requests (true) or suppresses (false) a background summary of
+	// this document, overriding the batch-wide WithSummarize and the tenant
+	// default. Nil leaves those defaults in effect.
+	Summarize *bool `json:"summarize,omitempty"`
 }
 
 // BatchSearchQuery represents a single query in a batch search request.
@@ -635,6 +666,7 @@ type batchInsertItemWire struct {
 	EntityID  string   `json:"entity_id,omitempty"`
 	Source    string   `json:"source,omitempty"`
 	Metadata  Metadata `json:"metadata,omitempty"`
+	Summarize *bool    `json:"summarize,omitempty"`
 	Partition string   `json:"partition,omitempty"`
 }
 
@@ -642,6 +674,7 @@ type batchInsertRequest struct {
 	Documents []batchInsertItemWire `json:"documents"`
 	ChunkSize *int                  `json:"chunk_size,omitempty"`
 	Overlap   *int                  `json:"overlap,omitempty"`
+	Summarize *bool                 `json:"summarize,omitempty"`
 }
 
 type batchInsertResponse struct {
